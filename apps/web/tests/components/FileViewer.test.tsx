@@ -68,16 +68,6 @@ function deferredResponse() {
   return { promise, resolve };
 }
 
-function srcDocActivationMessages(calls: readonly (readonly unknown[])[]) {
-  return calls
-    .map(([message]) => message)
-    .filter((message): message is { type: 'od:srcdoc-transport-activate'; html: string } => {
-      if (typeof message !== 'object' || message === null) return false;
-      const data = message as { type?: unknown; html?: unknown };
-      return data.type === 'od:srcdoc-transport-activate' && typeof data.html === 'string';
-    });
-}
-
 function clickAgentTool(testId: string) {
   fireEvent.click(screen.getByTestId(testId));
 }
@@ -754,6 +744,7 @@ describe('FileViewer SVG artifacts', () => {
     expect(markup).toContain('data-od-render-mode="srcdoc"');
     expect(markup).toContain('data-od-render-mode="srcdoc" data-od-active="true"');
     expect(markup).toContain('data-od-render-mode="url-load" data-od-active="false"');
+    expect(markup).not.toContain('data-od-lazy-srcdoc-transport');
     expect(markup).toContain('sandbox="allow-scripts allow-downloads"');
   });
 
@@ -1314,8 +1305,8 @@ describe('FileViewer SVG artifacts', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /share/i }));
 
-    expect(await screen.findByRole('menuitem', { name: /Copy link · Vercel/i })).toBeTruthy();
-    const cloudflareCopy = await screen.findByRole('menuitem', { name: /Copy link · Cloudflare Pages/i });
+    expect(await screen.findByRole('menuitem', { name: /Copy Vercel link/i })).toBeTruthy();
+    const cloudflareCopy = await screen.findByRole('menuitem', { name: /Copy Cloudflare link/i });
     fireEvent.click(cloudflareCopy);
 
     expect(writeText).toHaveBeenCalledWith('https://cloudflare.pages.dev');
@@ -1361,8 +1352,8 @@ describe('FileViewer SVG artifacts', () => {
 
     fireEvent.click(screen.getByRole('button', { name: /share/i }));
 
-    expect(await screen.findByRole('menuitem', { name: /Copy link · Cloudflare Pages/i })).toBeTruthy();
-    expect(screen.queryByRole('menuitem', { name: /Copy link · Vercel/i })).toBeNull();
+    expect(await screen.findByRole('menuitem', { name: /Copy Cloudflare link/i })).toBeTruthy();
+    expect(screen.queryByRole('menuitem', { name: /Copy Vercel link/i })).toBeNull();
   });
 
   it('renders unsafe SVG source as escaped text instead of executable markup', () => {
@@ -1447,6 +1438,8 @@ describe('FileViewer tweaks toolbar', () => {
     const labels: Partial<Record<keyof Dict, string>> = {
       'chat.tabComments': 'Comments',
       'chat.comments.emptySaved': 'No saved comments.',
+      'chat.comments.targetText': 'Text',
+      'chat.comments.targetLink': 'Link',
       'common.close': 'Close',
       'preview.showSidebar': 'Show Comments',
       'preview.hideSidebar': 'Hide Comments',
@@ -1501,11 +1494,10 @@ describe('FileViewer tweaks toolbar', () => {
     expect(screen.queryByPlaceholderText('Add a note for this annotation')).toBeNull();
 
     fireEvent.click(screen.getByTestId('screenshot-capture-toggle'));
-    expect(screen.getByPlaceholderText('Add a note for this annotation')).toBeTruthy();
-    expect(screen.queryByRole('status')).toBeNull();
-    expect(screen.getByTestId('screenshot-capture-toggle').getAttribute('aria-pressed')).toBe('true');
+    expect(screen.queryByPlaceholderText('Add a note for this annotation')).toBeNull();
+    expect(screen.getByRole('status').textContent).toContain('Copying screenshot');
+    expect(screen.getByTestId('screenshot-capture-toggle').getAttribute('aria-pressed')).toBe('false');
     expect(screen.getByTestId('draw-overlay-toggle').getAttribute('aria-pressed')).toBe('false');
-    expect(screen.getByRole('button', { name: 'Send' })).toHaveProperty('disabled', false);
   });
 
   it('keeps the Draw bar open after queueing an annotation', () => {
@@ -1527,7 +1519,7 @@ describe('FileViewer tweaks toolbar', () => {
     expect(screen.queryByPlaceholderText('Add a note for this annotation')).toBeNull();
   });
 
-  it('keeps the preloaded selection bridge mounted while the Draw bar is open', async () => {
+  it('uses a materialized srcDoc bridge while the Draw bar is open', async () => {
     render(
       <FileViewer projectId="project-1" projectKind="prototype" file={htmlPreviewFile()}
         liveHtml='<html><body><main data-od-id="hero">Hero</main></body></html>'
@@ -1541,6 +1533,7 @@ describe('FileViewer tweaks toolbar', () => {
       const activeFrame = screen.getByTestId('artifact-preview-frame') as HTMLIFrameElement;
       expect(activeFrame.getAttribute('data-od-render-mode')).toBe('srcdoc');
       expect(activeFrame.srcdoc).toContain('data-od-selection-bridge');
+      expect(activeFrame.srcdoc).toContain('data-od-snapshot-bridge');
       expect(activeFrame.srcdoc).not.toContain('data-od-lazy-srcdoc-transport');
       return activeFrame;
     });
@@ -1620,6 +1613,57 @@ describe('FileViewer tweaks toolbar', () => {
     expect(screen.getByTestId('comment-side-panel')).toBeTruthy();
     expect(screen.queryByTestId('comment-saved-marker-pin-applying')).toBeNull();
     expect(screen.queryByText('Already sent to Claude')).toBeNull();
+  });
+
+  it('shows the open comment count beside the comments icon', () => {
+    const openComment: PreviewComment = {
+      id: 'comment-open',
+      projectId: 'project-1',
+      conversationId: 'conversation-1',
+      filePath: 'preview.html',
+      elementId: 'pin-open',
+      selector: '[data-od-pin="pin-open"]',
+      label: 'pin-open',
+      text: '',
+      htmlHint: '',
+      position: { x: 24, y: 32, width: 18, height: 18 },
+      note: 'Open comment',
+      status: 'open',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+    const otherFileComment: PreviewComment = {
+      ...openComment,
+      id: 'comment-other',
+      filePath: 'other.html',
+    };
+    const resolvedComment: PreviewComment = {
+      ...openComment,
+      id: 'comment-resolved',
+      status: 'applying',
+    };
+
+    render(
+      <FileViewer
+        projectId="project-1"
+        projectKind="prototype"
+        file={htmlPreviewFile()}
+        liveHtml='<html><body><main data-od-id="hero">Hero</main></body></html>'
+        previewComments={[openComment, otherFileComment, resolvedComment]}
+      />,
+    );
+
+    const commentsButton = screen.getByTestId('comment-panel-toggle');
+    expect(commentsButton.textContent).toContain('1');
+    expect(commentsButton.getAttribute('aria-label')).toBe('Comments (1)');
+    expect(
+      screen.getByTestId('board-mode-toggle').compareDocumentPosition(screen.getByTestId('manual-edit-mode-toggle')) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(
+      screen.getByTestId('screenshot-capture-toggle').compareDocumentPosition(commentsButton) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
   });
 
   it('keeps comments and annotation picker mutually exclusive', () => {
@@ -2076,6 +2120,45 @@ describe('FileViewer tweaks toolbar', () => {
     expect(screen.queryByText('不要github，换成微信')).toBeNull();
     expect(screen.queryByTestId('comment-side-selectbar')).toBeNull();
     expect(screen.queryByTestId('comment-side-collapsed-rail')).toBeNull();
+  });
+
+  it('does not classify text labels containing a standalone article as links', () => {
+    const comment: PreviewComment = {
+      id: 'comment-plain-text',
+      projectId: 'project-1',
+      conversationId: 'conversation-1',
+      filePath: 'preview.html',
+      elementId: 'copy-1',
+      selector: '[data-od-id="copy-1"]',
+      label: 'Turn a brand brief into an editorial collage system.',
+      text: 'Turn a brand brief into an editorial collage system.',
+      htmlHint: '<p data-od-id="copy-1">',
+      position: { x: 16, y: 24, width: 320, height: 48 },
+      note: 'Make this copy tighter.',
+      status: 'open',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    };
+
+    render(
+      <CommentSidePanel
+        comments={[comment]}
+        selectedIds={new Set()}
+        activeCommentId={null}
+        collapsed={false}
+        onCollapsedChange={() => {}}
+        onClose={() => {}}
+        onToggleSelect={() => {}}
+        onClearSelection={() => {}}
+        onReply={() => {}}
+        onSendSelected={() => {}}
+        sending={false}
+        t={t}
+      />,
+    );
+
+    expect(screen.getByText('1. Text')).toBeTruthy();
+    expect(screen.queryByText('Link')).toBeNull();
   });
 
   it('deletes selected comments when clear is clicked', async () => {
