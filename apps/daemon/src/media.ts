@@ -71,6 +71,11 @@ import {
   mimeFor,
   sanitizeName,
 } from './projects.js';
+import {
+  AIHUBMIX_DEFAULT_BASE_URL,
+  aihubmixHeaders,
+  aihubmixWireModel,
+} from './aihubmix.js';
 
 const execFile = promisify(execFileCb);
 type ProviderConfig = { apiKey?: string; baseUrl?: string; model?: string };
@@ -500,6 +505,20 @@ export async function generateMedia(args: {
       && ctx.audioKind === 'speech'
     ) {
       const result = await renderOpenAISpeech(ctx, credentials, safeOut);
+      bytes = result.bytes;
+      providerNote = result.providerNote;
+      suggestedExt = result.suggestedExt;
+    } else if (def.provider === 'aihubmix' && surface === 'image') {
+      const result = await renderAIHubMixImage(ctx, credentials);
+      bytes = result.bytes;
+      providerNote = result.providerNote;
+      suggestedExt = result.suggestedExt;
+    } else if (
+      def.provider === 'aihubmix'
+      && surface === 'audio'
+      && ctx.audioKind === 'speech'
+    ) {
+      const result = await renderAIHubMixTTS(ctx, credentials, safeOut);
       bytes = result.bytes;
       providerNote = result.providerNote;
       suggestedExt = result.suggestedExt;
@@ -2850,6 +2869,105 @@ async function renderSenseAudioImage(ctx: MediaContext, credentials: ProviderCon
     bytes,
     providerNote: `senseaudio/${ctx.wireModel} · ${size}${reference ? ' · i2i' : ''} · ${bytes.length} bytes`,
     suggestedExt: '.png',
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Provider: AIHubMix — OpenAI-wire-compatible aggregator.
+//
+// Image:  POST /v1/images/generations  (OpenAI shape, b64_json or url)
+// Speech: POST /v1/audio/speech        (OpenAI shape, raw audio bytes)
+// Every request carries the fixed APP-Code attribution header. Catalogue ids
+// are `aihubmix-<wire>`; aihubmixWireModel() strips the prefix to the real
+// upstream model name before it hits the gateway.
+// ---------------------------------------------------------------------------
+
+async function renderAIHubMixImage(ctx: MediaContext, credentials: ProviderConfig): Promise<RenderResult> {
+  if (!credentials.apiKey) {
+    throw new Error('no AIHubMix API key — configure it in Settings or set OD_AIHUBMIX_API_KEY');
+  }
+  const baseUrl = credentials.baseUrl || AIHUBMIX_DEFAULT_BASE_URL;
+  const wireModel = aihubmixWireModel(credentials.model || ctx.wireModel);
+  const url = buildOpenAIImageUrl(baseUrl, false);
+
+  const body: Record<string, unknown> = {
+    model: wireModel,
+    prompt: ctx.prompt || 'A high-quality reference image.',
+    n: 1,
+    size: openaiSizeFor(wireModel, ctx.aspect),
+  };
+  if (wireModel.startsWith('dall-e-')) {
+    body.response_format = 'b64_json';
+    body.quality = wireModel === 'dall-e-3' ? 'hd' : 'standard';
+  } else {
+    body.quality = 'high';
+  }
+
+  const resp = await fetch(url, withMediaRequestInit(ctx, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...aihubmixHeaders(credentials.apiKey) },
+    body: JSON.stringify(body),
+  }));
+  const text = await resp.text();
+  if (!resp.ok) {
+    throw new Error(`aihubmix ${resp.status}: ${truncate(text, 240)}`);
+  }
+  let data: any;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new Error(`aihubmix non-JSON response: ${truncate(text, 200)}`);
+  }
+  const entry = data && Array.isArray(data.data) ? data.data[0] : null;
+  if (!entry) throw new Error('aihubmix response had no data[0]');
+  let bytes;
+  if (entry.b64_json) {
+    bytes = Buffer.from(entry.b64_json, 'base64');
+  } else if (entry.url) {
+    const urlCheck = await assertExternalAssetUrl(entry.url);
+    if (!urlCheck.ok) throw new Error(urlCheck.error);
+    const imgResp = await fetch(entry.url, withMediaRequestInit(ctx));
+    if (!imgResp.ok) throw new Error(`aihubmix image fetch ${imgResp.status}`);
+    bytes = Buffer.from(await imgResp.arrayBuffer());
+  } else {
+    throw new Error('aihubmix response had neither b64_json nor url');
+  }
+  return {
+    bytes,
+    providerNote: `aihubmix/${wireModel} · ${ctx.aspect} · ${bytes.length} bytes`,
+    suggestedExt: '.png',
+  };
+}
+
+async function renderAIHubMixTTS(ctx: MediaContext, credentials: ProviderConfig, fileName: string): Promise<RenderResult> {
+  if (!credentials.apiKey) {
+    throw new Error('no AIHubMix API key — configure it in Settings or set OD_AIHUBMIX_API_KEY');
+  }
+  const baseUrl = credentials.baseUrl || AIHUBMIX_DEFAULT_BASE_URL;
+  const wireModel = aihubmixWireModel(credentials.model || ctx.wireModel);
+  const url = buildOpenAISpeechUrl(baseUrl, false);
+  const format = openaiSpeechFormatFor(fileName);
+  const text = (ctx.prompt && ctx.prompt.trim()) || 'This is a test.';
+  const requestedVoice = (ctx.voice && ctx.voice.trim()) || '';
+  const voice = requestedVoice && OPENAI_TTS_VOICES.has(requestedVoice) ? requestedVoice : 'alloy';
+
+  const resp = await fetch(url, withMediaRequestInit(ctx, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...aihubmixHeaders(credentials.apiKey) },
+    body: JSON.stringify({ model: wireModel, input: text, voice, response_format: format }),
+  }));
+  if (!resp.ok) {
+    const errText = await resp.text();
+    throw new Error(`aihubmix speech ${resp.status}: ${truncate(errText, 240)}`);
+  }
+  const bytes = Buffer.from(await resp.arrayBuffer());
+  if (bytes.length === 0) {
+    throw new Error('aihubmix speech returned zero bytes');
+  }
+  return {
+    bytes,
+    providerNote: `aihubmix/${wireModel} · ${voice} · ${format} · ${bytes.length} bytes`,
+    suggestedExt: format === 'opus' ? '.ogg' : `.${format}`,
   };
 }
 

@@ -304,6 +304,21 @@ export const KNOWN_PROVIDERS: KnownProvider[] = [
       'MiniMax-M2.7',
     ],
   },
+  {
+    label: 'AIHubMix',
+    protocol: 'aihubmix',
+    baseUrl: 'https://aihubmix.com/v1',
+    model: 'gpt-4o',
+    models: [
+      'gpt-4o',
+      'gpt-4o-mini',
+      'claude-sonnet-4-5',
+      'claude-haiku-4-5',
+      'gemini-2.0-flash',
+      'deepseek-chat',
+      'deepseek-reasoner',
+    ],
+  },
 ];
 
 function normalizePet(input: Partial<PetConfig> | undefined): PetConfig {
@@ -349,6 +364,10 @@ function inferApiProtocol(model: string, baseUrl: string): ApiProtocol {
     // and the BYOK tab UI stay consistent with the protocol the user
     // picked — even though the on-wire shape is OpenAI-compatible.
     if (normalized.includes('senseaudio.cn')) return 'senseaudio';
+    // AIHubMix host routes to its own proxy so the daemon injects the
+    // APP-Code attribution header even though the wire shape is
+    // OpenAI-compatible.
+    if (normalized.includes('aihubmix.com')) return 'aihubmix';
     return isOpenAICompatible(model, baseUrl) ? 'openai' : 'anthropic';
   } catch {
     // Preserve the rest of the user's settings even if an old saved base URL is

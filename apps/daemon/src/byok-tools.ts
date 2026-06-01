@@ -19,6 +19,12 @@ import { assertExternalAssetUrl } from './connectionTest.js';
 import { resolveProviderConfig } from './media-config.js';
 import { IMAGE_MODELS } from './media-models.js';
 import { ensureProject } from './projects.js';
+import {
+  AIHUBMIX_DEFAULT_BASE_URL,
+  aihubmixHeaders,
+  aihubmixWireModel,
+  AIHUBMIX_IMAGE_ASPECT_TO_SIZE,
+} from './aihubmix.js';
 
 // SenseAudio image model allowlist — derived from the shared media-models
 // registry so adding a new SenseAudio image model in one place (media-models)
@@ -38,6 +44,23 @@ export const BYOK_SENSEAUDIO_DEFAULT_IMAGE_MODEL =
 export function isSenseAudioImageModel(value: unknown): value is string {
   return typeof value === 'string' && BYOK_SENSEAUDIO_IMAGE_MODELS.includes(value);
 }
+
+// AIHubMix image-model allowlist — same registry-derived pattern as SenseAudio
+// so a new `provider: 'aihubmix'` image entry auto-extends the chat tool enum,
+// the Settings dropdown, and the daemon-side validation with no hand edits.
+export const BYOK_AIHUBMIX_IMAGE_MODELS: readonly string[] = IMAGE_MODELS
+  .filter((m) => m.provider === 'aihubmix')
+  .map((m) => m.id);
+
+export const BYOK_AIHUBMIX_DEFAULT_IMAGE_MODEL =
+  BYOK_AIHUBMIX_IMAGE_MODELS[0] ?? 'aihubmix-gpt-image-1';
+
+export function isAIHubMixImageModel(value: unknown): value is string {
+  return typeof value === 'string' && BYOK_AIHUBMIX_IMAGE_MODELS.includes(value);
+}
+
+const AIHUBMIX_DEFAULT_TTS_MODEL = 'tts-1';
+const AIHUBMIX_DEFAULT_TTS_VOICE = 'alloy';
 
 const SENSEAUDIO_DEFAULT_BASE_URL = 'https://api.senseaudio.cn';
 const PROMPT_MAX_LENGTH = 2000;
@@ -196,6 +219,72 @@ export const BYOK_SENSEAUDIO_TOOLS = [
           },
         },
         required: ['prompt'],
+      },
+    },
+  },
+];
+
+/**
+ * OpenAI-compatible tool definitions injected into /api/proxy/aihubmix/stream.
+ * AIHubMix routes image generation to `/v1/images/generations` (OpenAI shape)
+ * and speech to `/v1/audio/speech`, so the chat session gets image + voiceover
+ * parity. Video is intentionally omitted — AIHubMix does not document a video
+ * endpoint, and silently injecting a non-working tool would just produce
+ * failed tool calls.
+ */
+export const BYOK_AIHUBMIX_TOOLS = [
+  {
+    type: 'function' as const,
+    function: {
+      name: 'generate_image',
+      description:
+        'Generate an image from a text prompt using AIHubMix image models (OpenAI-compatible). Returns a URL pointing to the rendered PNG. After this tool succeeds, embed the URL in your reply with markdown image syntax — ![alt](url) — so the user sees the image inline. Use this whenever the user asks to draw, create, generate, design, or illustrate something visual.',
+      parameters: {
+        type: 'object',
+        properties: {
+          prompt: {
+            type: 'string',
+            description:
+              'Detailed visual description of the image (Chinese or English are both fine). Include subject, style, lighting, composition. Maximum 2000 characters.',
+          },
+          aspect_ratio: {
+            type: 'string',
+            enum: ['1:1', '16:9', '9:16', '4:3', '3:4'],
+            description:
+              'Output aspect ratio. 1:1 for square avatars and product shots, 16:9 for hero banners, 9:16 for vertical phone posters, 4:3 for editorial covers, 3:4 for posters. Defaults to 1:1 when omitted.',
+          },
+          model: {
+            type: 'string',
+            enum: [...BYOK_AIHUBMIX_IMAGE_MODELS],
+            description:
+              'Optional model override. Omit this to use the user-configured default from Settings (gpt-image-1 when unset).',
+          },
+        },
+        required: ['prompt'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'generate_speech',
+      description:
+        'Generate a text-to-speech voiceover using AIHubMix TTS (OpenAI-compatible). Returns a URL pointing to the rendered MP3. Use this whenever the user asks for narration, voiceover, speech, TTS, or spoken audio. After this tool succeeds, reply with a clickable markdown link to the MP3.',
+      parameters: {
+        type: 'object',
+        properties: {
+          text: {
+            type: 'string',
+            description:
+              'Exact script to speak. Include only the words that should be spoken, not production notes.',
+          },
+          voice_id: {
+            type: 'string',
+            description:
+              `Optional OpenAI-style voice id (alloy, echo, fable, onyx, nova, shimmer). Defaults to ${AIHUBMIX_DEFAULT_TTS_VOICE}.`,
+          },
+        },
+        required: ['text'],
       },
     },
   },
@@ -734,6 +823,173 @@ export async function executeGenerateVideo(
   const filename = `byok-video-${id}.mp4`;
   await writeFile(path.join(dir, filename), bytes);
 
+  return {
+    ok: true,
+    url: `/api/projects/${encodeURIComponent(ctx.projectId)}/files/${filename}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// AIHubMix tool executors (OpenAI-wire-compatible).
+//
+// Unlike the SenseAudio executors above (which hit proprietary /v1/image/sync
+// and /v1/t2a_v2 endpoints), AIHubMix speaks the OpenAI image/audio shapes:
+//   POST /v1/images/generations  → { data: [{ b64_json | url }] }
+//   POST /v1/audio/speech        → raw audio bytes
+// Every request carries the fixed APP-Code header via aihubmixHeaders().
+// ---------------------------------------------------------------------------
+
+function appendOpenAIApiPath(baseUrl: string, suffix: string): string {
+  const url = new URL(baseUrl);
+  const trimmed = url.pathname.replace(/\/+$/, '');
+  url.pathname = /\/v\d+(\/|$)/.test(trimmed)
+    ? `${trimmed}${suffix}`
+    : `${trimmed}/v1${suffix}`;
+  return url.toString();
+}
+
+async function resolveAIHubMixCredentials(
+  ctx: BYOKToolContext,
+): Promise<{ apiKey: string; baseUrl: string }> {
+  let apiKey = ctx.upstreamApiKey;
+  let baseUrl = ctx.upstreamBaseUrl || AIHUBMIX_DEFAULT_BASE_URL;
+  if (!apiKey) {
+    const resolved = await resolveProviderConfig(ctx.projectRoot, 'aihubmix');
+    apiKey = resolved.apiKey || '';
+    if (resolved.baseUrl) baseUrl = resolved.baseUrl;
+  }
+  return { apiKey, baseUrl };
+}
+
+export async function executeAIHubMixGenerateImage(
+  args: { prompt?: unknown; aspect_ratio?: unknown; model?: unknown },
+  ctx: BYOKToolContext,
+): Promise<ImageToolResult> {
+  const promptRaw = typeof args.prompt === 'string' ? args.prompt.trim() : '';
+  if (!promptRaw) return { ok: false, error: 'prompt is required' };
+  const prompt =
+    promptRaw.length > PROMPT_MAX_LENGTH ? promptRaw.slice(0, PROMPT_MAX_LENGTH) : promptRaw;
+
+  const aspect =
+    typeof args.aspect_ratio === 'string' && AIHUBMIX_IMAGE_ASPECT_TO_SIZE[args.aspect_ratio]
+      ? args.aspect_ratio
+      : '1:1';
+  const size = AIHUBMIX_IMAGE_ASPECT_TO_SIZE[aspect];
+
+  // Model resolution: LLM arg > Settings default > registry default. The
+  // allowlist guards every step, then the catalogue id is mapped to the real
+  // upstream wire name before it reaches AIHubMix.
+  const catalogModel = isAIHubMixImageModel(args.model)
+    ? args.model
+    : isAIHubMixImageModel(ctx.defaultImageModel)
+      ? ctx.defaultImageModel
+      : BYOK_AIHUBMIX_DEFAULT_IMAGE_MODEL;
+  const wireModel = aihubmixWireModel(catalogModel);
+
+  let dir: string;
+  try {
+    dir = await ensureProject(ctx.projectsRoot, ctx.projectId);
+  } catch (err) {
+    return {
+      ok: false,
+      error: `invalid projectId for image storage: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
+  const { apiKey, baseUrl } = await resolveAIHubMixCredentials(ctx);
+  if (!apiKey) return { ok: false, error: 'no AIHubMix API key available' };
+
+  let bytes: Buffer;
+  try {
+    const resp = await fetch(appendOpenAIApiPath(baseUrl, '/images/generations'), withToolRequestInit(ctx, {
+      method: 'POST',
+      redirect: 'error',
+      headers: { 'content-type': 'application/json', ...aihubmixHeaders(apiKey) },
+      body: JSON.stringify({ model: wireModel, prompt, n: 1, size }),
+    }));
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '');
+      return { ok: false, error: `aihubmix image ${resp.status}: ${text.slice(0, 240)}` };
+    }
+    const data = (await resp.json()) as { data?: Array<{ b64_json?: string; url?: string }> };
+    const entry = Array.isArray(data?.data) ? data.data[0] : null;
+    if (!entry) return { ok: false, error: 'aihubmix image response had no data[0]' };
+    if (entry.b64_json) {
+      bytes = Buffer.from(entry.b64_json, 'base64');
+    } else if (entry.url) {
+      const urlCheck = await assertExternalAssetUrl(entry.url);
+      if (!urlCheck.ok) return { ok: false, error: urlCheck.error };
+      const imgResp = await fetch(entry.url, withToolRequestInit(ctx, { redirect: 'error' }));
+      if (!imgResp.ok) return { ok: false, error: `image download ${imgResp.status}` };
+      bytes = Buffer.from(await imgResp.arrayBuffer());
+    } else {
+      return { ok: false, error: 'aihubmix image response had neither b64_json nor url' };
+    }
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+  if (bytes.length === 0) return { ok: false, error: 'aihubmix image returned zero bytes' };
+
+  const id = `${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`;
+  const filename = `byok-${id}.png`;
+  await writeFile(path.join(dir, filename), bytes);
+  return {
+    ok: true,
+    url: `/api/projects/${encodeURIComponent(ctx.projectId)}/files/${filename}`,
+  };
+}
+
+export async function executeAIHubMixGenerateSpeech(
+  args: { text?: unknown; voice_id?: unknown },
+  ctx: BYOKToolContext,
+): Promise<ImageToolResult> {
+  const text = typeof args.text === 'string' ? args.text.trim() : '';
+  if (!text) return { ok: false, error: 'text is required' };
+
+  let dir: string;
+  try {
+    dir = await ensureProject(ctx.projectsRoot, ctx.projectId);
+  } catch (err) {
+    return {
+      ok: false,
+      error: `invalid projectId for speech storage: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
+  const { apiKey, baseUrl } = await resolveAIHubMixCredentials(ctx);
+  if (!apiKey) return { ok: false, error: 'no AIHubMix API key available' };
+
+  const voice =
+    typeof args.voice_id === 'string' && args.voice_id.trim()
+      ? args.voice_id.trim()
+      : AIHUBMIX_DEFAULT_TTS_VOICE;
+
+  let bytes: Buffer;
+  try {
+    const resp = await fetch(appendOpenAIApiPath(baseUrl, '/audio/speech'), withToolRequestInit(ctx, {
+      method: 'POST',
+      redirect: 'error',
+      headers: { 'content-type': 'application/json', ...aihubmixHeaders(apiKey) },
+      body: JSON.stringify({
+        model: AIHUBMIX_DEFAULT_TTS_MODEL,
+        input: text,
+        voice,
+        response_format: 'mp3',
+      }),
+    }));
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => '');
+      return { ok: false, error: `aihubmix speech ${resp.status}: ${errText.slice(0, 240)}` };
+    }
+    bytes = Buffer.from(await resp.arrayBuffer());
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+  if (bytes.length === 0) return { ok: false, error: 'aihubmix speech returned zero bytes' };
+
+  const id = `${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`;
+  const filename = `byok-speech-${id}.mp3`;
+  await writeFile(path.join(dir, filename), bytes);
   return {
     ok: true,
     url: `/api/projects/${encodeURIComponent(ctx.projectId)}/files/${filename}`,

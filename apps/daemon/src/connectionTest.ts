@@ -52,6 +52,7 @@ import {
   buildOpenAIChatTokenParam,
   isUnsupportedMaxTokensError,
 } from './openai-chat-token-params.js';
+import { aihubmixHeaders } from './aihubmix.js';
 import type { AgentCliEnvPrefs } from './app-config.js';
 import type { RuntimeAgentDef } from './runtimes/types.js';
 import { resolveModelForAgent } from './runtimes/models.js';
@@ -697,9 +698,11 @@ function inspectProviderCompletion(
   const obj = data && typeof data === 'object' ? data as Record<string, unknown> : null;
   if (!obj) return { valid: false };
 
-  if (protocol === 'openai' || protocol === 'azure' || protocol === 'senseaudio') {
+  if (protocol === 'openai' || protocol === 'azure' || protocol === 'senseaudio' || protocol === 'aihubmix') {
     const responseModel = typeof obj.model === 'string' ? obj.model : '';
     if (
+      // AIHubMix is omitted from the strict response-model check (like Azure):
+      // its gateway routes by model name and may echo a normalized id.
       (protocol === 'openai' || protocol === 'senseaudio') &&
       enforceResponseModel &&
       responseModel &&
@@ -1013,6 +1016,24 @@ function buildProviderCall(input: ProviderTestRequest): ProviderCallShape {
           }
           return '';
         },
+      };
+    case 'aihubmix':
+      // AIHubMix is wire-compatible with OpenAI but carries the fixed APP-Code
+      // attribution header on every request (see aihubmixHeaders). Same body /
+      // response shape as the OpenAI case otherwise.
+      return {
+        url: appendVersionedApiPath(baseUrl, '/chat/completions'),
+        headers: {
+          'content-type': 'application/json',
+          ...aihubmixHeaders(apiKey),
+        },
+        body: {
+          model,
+          ...buildOpenAIChatTokenParam(model, PROVIDER_MAX_TOKENS),
+          messages: [{ role: 'user', content: SMOKE_PROMPT }],
+          stream: false,
+        },
+        extractText: extractOpenAIMessageText,
       };
     case 'openai':
     case 'senseaudio':

@@ -9,12 +9,18 @@ import {
 } from './openai-chat-token-params.js';
 import {
   BYOK_SENSEAUDIO_TOOLS,
+  BYOK_AIHUBMIX_TOOLS,
   executeGenerateImage,
   executeGenerateSpeech,
   executeGenerateVideo,
+  executeAIHubMixGenerateImage,
+  executeAIHubMixGenerateSpeech,
   isSenseAudioImageModel,
+  isAIHubMixImageModel,
   type BYOKToolContext,
+  type ImageToolResult,
 } from './byok-tools.js';
+import { AIHUBMIX_DEFAULT_BASE_URL, aihubmixHeaders } from './aihubmix.js';
 import { isSafeId as isSafeProjectId } from './projects.js';
 import { projectKindToTracking } from '@open-design/contracts/analytics';
 import { proxyDispatcherRequestInit, validateBaseUrlResolved } from './connectionTest.js';
@@ -240,13 +246,13 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
     const protocol = body.protocol;
     if (
       typeof protocol !== 'string' ||
-      !['anthropic', 'openai', 'azure', 'google', 'ollama', 'senseaudio'].includes(protocol)
+      !['anthropic', 'openai', 'azure', 'google', 'ollama', 'senseaudio', 'aihubmix'].includes(protocol)
     ) {
       return sendApiError(
         res,
         400,
         'BAD_REQUEST',
-        'protocol must be one of anthropic|openai|azure|google|ollama|senseaudio',
+        'protocol must be one of anthropic|openai|azure|google|ollama|senseaudio|aihubmix',
       );
     }
     if (
@@ -307,13 +313,13 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
         const protocol = body.protocol;
         if (
           typeof protocol !== 'string' ||
-          !['anthropic', 'openai', 'azure', 'google', 'ollama', 'senseaudio'].includes(protocol)
+          !['anthropic', 'openai', 'azure', 'google', 'ollama', 'senseaudio', 'aihubmix'].includes(protocol)
         ) {
           return sendApiError(
             res,
             400,
             'BAD_REQUEST',
-            'protocol must be one of anthropic|openai|azure|google|ollama|senseaudio',
+            'protocol must be one of anthropic|openai|azure|google|ollama|senseaudio|aihubmix',
           );
         }
         if (
@@ -1262,7 +1268,31 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
         toolCalls: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }>;
       };
 
-  app.post('/api/proxy/senseaudio/stream', async (req, res) => {
+  // Shared shape for the two BYOK tool-loop chat proxies (SenseAudio,
+  // AIHubMix). Both speak the OpenAI chat-completions wire and inject a
+  // daemon-side `tools` array; they differ only in default base URL, outbound
+  // headers (AIHubMix carries the APP-Code attribution header), the tool
+  // definitions/allowlist, and which executor backs each tool. Funnelling
+  // both through one factory keeps the tool-loop streaming logic single-source.
+  type ByokToolRunner = (args: any, toolCtx: BYOKToolContext) => Promise<ImageToolResult>;
+  interface ByokToolChatProxyOptions {
+    providerId: string;
+    logTag: string;
+    defaultBaseUrl: string;
+    tools: any[];
+    buildHeaders: (apiKey: string) => Record<string, string>;
+    isImageModel: (value: unknown) => boolean;
+    runImage: ByokToolRunner;
+    runSpeech: ByokToolRunner;
+    /** Omitted when the provider has no video endpoint (AIHubMix). */
+    runVideo?: ByokToolRunner;
+  }
+
+  const registerByokToolChatProxy = (
+    routePath: string,
+    opts: ByokToolChatProxyOptions,
+  ) => {
+   app.post(routePath, async (req, res) => {
     const proxyBody = req.body || {};
     if (rejectProxyPluginContext(proxyBody, res)) return;
     const {
@@ -1297,7 +1327,7 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
       );
     }
 
-    const effectiveBaseUrl = baseUrl || 'https://api.senseaudio.cn';
+    const effectiveBaseUrl = baseUrl || opts.defaultBaseUrl;
     const validated = await validateExternalApiBaseUrl(effectiveBaseUrl);
     if (validated.error) {
       return sendApiError(
@@ -1310,7 +1340,7 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
 
     const url = appendVersionedApiPath(effectiveBaseUrl, '/chat/completions');
     console.log(
-      `[proxy:senseaudio] ${req.method} ${validated.parsed?.hostname ?? '?'} model=${model} project=${projectId}`,
+      `[${opts.logTag}] ${req.method} ${validated.parsed?.hostname ?? '?'} model=${model} project=${projectId}`,
     );
 
     const workingMessages: any[] = Array.isArray(messages) ? [...messages] : [];
@@ -1325,10 +1355,10 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
     // loads images same-origin through the standard project file
     // route — no CSP / CORS exceptions needed.
     // User-configured BYOK default image model. Drop silently if the
-    // client sent an id outside the SenseAudio registry — the tool
+    // client sent an id outside the provider's registry — the tool
     // will fall back to the registry default and the LLM can still
     // override per-call via the tool's `model` arg.
-    const validDefaultImageModel = isSenseAudioImageModel(byokImageModel)
+    const validDefaultImageModel = opts.isImageModel(byokImageModel)
       ? byokImageModel
       : undefined;
 
@@ -1343,8 +1373,8 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
       requestInit: {},
       // Spread-conditional because tsconfig's exactOptionalPropertyTypes
       // forbids `field: undefined` on an optional slot. The byok-tools
-      // executor reads `ctx.defaultImageModel` with `isSenseAudioImageModel`
-      // anyway, so a missing key and an undefined value behave the same.
+      // executor re-validates `ctx.defaultImageModel` against the provider's
+      // allowlist anyway, so a missing key and an undefined value behave the same.
       ...(validDefaultImageModel
         ? { defaultImageModel: validDefaultImageModel }
         : {}),
@@ -1355,7 +1385,7 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
     // a typed result describing what to do next (loop on tool calls,
     // close the stream, or bail on error). Closures capture all the
     // SSE helpers from registerChatRoutes.
-    const runSenseAudioTurn = async (
+    const runTurn = async (
       sse: any,
       messagesForTurn: any[],
     ): Promise<TurnResult> => {
@@ -1365,7 +1395,7 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
         max_tokens:
           typeof maxTokens === 'number' && maxTokens > 0 ? maxTokens : 8192,
         stream: true,
-        tools: BYOK_SENSEAUDIO_TOOLS,
+        tools: opts.tools,
         tool_choice: 'auto',
       };
       const response = await fetch(url, {
@@ -1373,7 +1403,7 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${apiKey}`,
+          ...opts.buildHeaders(apiKey),
         },
         body: JSON.stringify(payload),
         redirect: 'error',
@@ -1382,7 +1412,7 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
       if (!response.ok) {
         const errorText = await response.text();
         console.error(
-          `[proxy:senseaudio] upstream error: ${response.status} ${redactAuthTokens(errorText)}`,
+          `[${opts.logTag}] upstream error: ${response.status} ${redactAuthTokens(errorText)}`,
         );
         sendProxyError(sse, `Upstream error: ${response.status}`, {
           code: proxyErrorCode(response.status),
@@ -1505,39 +1535,44 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
         return { ok: false, error: 'tool arguments were not valid JSON', kind: toolKind };
       }
       if (fnName === 'generate_image') {
-        const result = await executeGenerateImage(args, toolCtx);
+        const result = await opts.runImage(args, toolCtx);
         return { ...result, kind: 'image' };
       }
       if (fnName === 'generate_speech') {
-        const result = await executeGenerateSpeech(args, toolCtx);
+        const result = await opts.runSpeech(args, toolCtx);
         return { ...result, kind: 'speech' };
       }
-      // generate_video — longer (up to 5 min), async-with-polling.
-      const result = await executeGenerateVideo(args, toolCtx);
+      // generate_video — longer (up to 5 min), async-with-polling. Only some
+      // providers expose it (SenseAudio yes, AIHubMix no); without a runner
+      // we surface a clear unsupported error the model can relay.
+      if (!opts.runVideo) {
+        return { ok: false, error: 'video generation is not supported for this provider', kind: 'video' };
+      }
+      const result = await opts.runVideo(args, toolCtx);
       return { ...result, kind: 'video' };
     };
 
     const sse = createSseResponse(res);
-    // SenseAudio's gateway issues one API key that works for both
+    // These gateways issue one API key that works for both
     // /v1/chat/completions and the image / TTS surfaces. Mirror the
     // BYOK key into media-config so the CLI agent path (`od media
     // generate`) picks it up automatically — fire-and-forget; the
     // chat stream must not block on the disk write. seedProviderIfMissing
     // is idempotent and preserves env-var-resolved keys.
-    seedProviderIfMissing(ctx.paths.PROJECT_ROOT, 'senseaudio', {
+    seedProviderIfMissing(ctx.paths.PROJECT_ROOT, opts.providerId, {
       apiKey,
       baseUrl: effectiveBaseUrl,
     })
       .then((seeded) => {
         if (seeded) {
           console.log(
-            '[proxy:senseaudio] seeded media-config.senseaudio from BYOK key',
+            `[${opts.logTag}] seeded media-config.${opts.providerId} from BYOK key`,
           );
         }
       })
       .catch((err: unknown) => {
         console.warn(
-          `[proxy:senseaudio] seed media-config failed: ${
+          `[${opts.logTag}] seed media-config failed: ${
             err instanceof Error ? err.message : String(err)
           }`,
         );
@@ -1548,7 +1583,7 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
       toolCtx.requestInit = proxyDispatcher.requestInit;
       sse.send('start', { model });
       for (let loop = 0; loop < MAX_BYOK_TOOL_LOOPS; loop++) {
-        const turn = await runSenseAudioTurn(sse, workingMessages);
+        const turn = await runTurn(sse, workingMessages);
         if (turn.kind === 'error') return sse.end();
         if (turn.kind === 'text_end') {
           sse.send('end', {});
@@ -1569,11 +1604,11 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
           const toolName = call?.function?.name ?? 'unknown';
           if (result.ok) {
             console.log(
-              `[proxy:senseaudio] ${toolName} OK: ${call.id} → ${result.url}`,
+              `[${opts.logTag}] ${toolName} OK: ${call.id} → ${result.url}`,
             );
           } else {
             console.warn(
-              `[proxy:senseaudio] ${toolName} FAILED: ${call.id} — ${result.error}`,
+              `[${opts.logTag}] ${toolName} FAILED: ${call.id} — ${result.error}`,
             );
           }
           const content = result.ok
@@ -1598,17 +1633,46 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
       // refuse a 4th round. Close the stream gracefully; the last text
       // delta the model emitted (if any) is already on the wire.
       console.warn(
-        '[proxy:senseaudio] tool loop bounded at MAX_BYOK_TOOL_LOOPS=3',
+        `[${opts.logTag}] tool loop bounded at MAX_BYOK_TOOL_LOOPS=${MAX_BYOK_TOOL_LOOPS}`,
       );
       sse.send('end', {});
       return sse.end();
     } catch (err: any) {
-      console.error(`[proxy:senseaudio] internal error: ${err.message}`);
+      console.error(`[${opts.logTag}] internal error: ${err.message}`);
       sendProxyError(sse, err.message, { code: 'INTERNAL_ERROR' });
       sse.end();
     } finally {
       await proxyDispatcher?.close();
     }
+   });
+  };
+
+  // SenseAudio: proprietary image (/v1/image/sync) + TTS (/v1/t2a_v2) + video
+  // (/v1/video/create) executors, Bearer auth.
+  registerByokToolChatProxy('/api/proxy/senseaudio/stream', {
+    providerId: 'senseaudio',
+    logTag: 'proxy:senseaudio',
+    defaultBaseUrl: 'https://api.senseaudio.cn',
+    tools: BYOK_SENSEAUDIO_TOOLS,
+    buildHeaders: (apiKey) => ({ Authorization: `Bearer ${apiKey}` }),
+    isImageModel: isSenseAudioImageModel,
+    runImage: executeGenerateImage,
+    runSpeech: executeGenerateSpeech,
+    runVideo: executeGenerateVideo,
+  });
+
+  // AIHubMix: OpenAI-compatible image (/v1/images/generations) + TTS
+  // (/v1/audio/speech) executors, Bearer auth + fixed APP-Code header. No
+  // video endpoint, so `runVideo` is omitted.
+  registerByokToolChatProxy('/api/proxy/aihubmix/stream', {
+    providerId: 'aihubmix',
+    logTag: 'proxy:aihubmix',
+    defaultBaseUrl: AIHUBMIX_DEFAULT_BASE_URL,
+    tools: BYOK_AIHUBMIX_TOOLS,
+    buildHeaders: (apiKey) => aihubmixHeaders(apiKey),
+    isImageModel: isAIHubMixImageModel,
+    runImage: executeAIHubMixGenerateImage,
+    runSpeech: executeAIHubMixGenerateSpeech,
   });
 
 }

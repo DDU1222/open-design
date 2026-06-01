@@ -142,11 +142,11 @@ interface Props {
   researchAvailable?: boolean;
   projectMetadata?: ProjectMetadata;
   onProjectMetadataChange?: (metadata: ProjectMetadata) => void;
-  // SenseAudio BYOK image-model picker shown above the textarea. Hidden
-  // when the active chat protocol is anything other than 'senseaudio',
-  // so the composer stays clean for every other BYOK tab. The state
-  // owner is ProjectView (per-session, reset on refresh); ChatComposer
-  // is a fully controlled select.
+  // BYOK image-model picker shown above the textarea for protocols that
+  // inject the daemon-side generate_image tool (SenseAudio, AIHubMix).
+  // Hidden for every other BYOK tab so the composer stays clean. The
+  // state owner is ProjectView (per-session, reset on refresh);
+  // ChatComposer is a fully controlled select.
   byokApiProtocol?: AppConfig['apiProtocol'];
   byokImageModel?: string;
   onChangeByokImageModel?: (model: string) => void;
@@ -1728,7 +1728,7 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
               t={t}
             />
           ) : null}
-          {byokApiProtocol === 'senseaudio' && onChangeByokImageModel ? (
+          {(byokApiProtocol === 'senseaudio' || byokApiProtocol === 'aihubmix') && onChangeByokImageModel ? (
             <div
               className="composer-byok-image-model"
               data-testid="composer-byok-image-model"
@@ -1762,10 +1762,10 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
                 }}
               >
                 <option value="">
-                  {(IMAGE_MODELS.find((m) => m.provider === 'senseaudio')?.label
-                    ?? 'senseaudio-image-2.0') + ' (default)'}
+                  {(IMAGE_MODELS.find((m) => m.provider === byokApiProtocol)?.label
+                    ?? 'default') + ' (default)'}
                 </option>
-                {IMAGE_MODELS.filter((m) => m.provider === 'senseaudio').map(
+                {IMAGE_MODELS.filter((m) => m.provider === byokApiProtocol).map(
                   (m) => (
                     <option key={m.id} value={m.id}>
                       {m.label}

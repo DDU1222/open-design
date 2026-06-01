@@ -10,6 +10,7 @@ import type {
 import { isLoopbackApiHost } from '@open-design/contracts/api/connectionTest';
 import { redactSecrets, validateBaseUrlResolved } from './connectionTest.js';
 import { googleProviderModelsUrl, normalizeGoogleModelId } from './google-models.js';
+import { aihubmixHeaders } from './aihubmix.js';
 
 type ProviderModelsInput = ProviderModelsRequest & {
   signal?: AbortSignal;
@@ -152,7 +153,7 @@ function extractGoogleModels(data: unknown): ProviderModelOption[] {
 }
 
 function providerModelsUrl(protocol: ConnectionTestProtocol, baseUrl: string, apiKey: string): string {
-  if (protocol === 'openai' || protocol === 'senseaudio') {
+  if (protocol === 'openai' || protocol === 'senseaudio' || protocol === 'aihubmix') {
     return appendVersionedApiPath(baseUrl, '/models');
   }
   if (protocol === 'anthropic') {
@@ -173,6 +174,10 @@ function providerModelsHeaders(
   if (protocol === 'openai' || protocol === 'senseaudio') {
     return { authorization: `Bearer ${apiKey}` };
   }
+  if (protocol === 'aihubmix') {
+    // Carry the fixed APP-Code attribution header on model discovery too.
+    return aihubmixHeaders(apiKey);
+  }
   if (protocol === 'anthropic') {
     return {
       'x-api-key': apiKey,
@@ -185,7 +190,7 @@ function providerModelsHeaders(
 function extractModels(protocol: ConnectionTestProtocol, data: unknown): ProviderModelOption[] {
   // SenseAudio's /v1/models response follows the OpenAI envelope
   // (`{ data: [{ id, ... }] }`), so the same extractor handles both.
-  if (protocol === 'openai' || protocol === 'senseaudio') return extractOpenAiModels(data);
+  if (protocol === 'openai' || protocol === 'senseaudio' || protocol === 'aihubmix') return extractOpenAiModels(data);
   if (protocol === 'anthropic') return extractAnthropicModels(data);
   if (protocol === 'google') return extractGoogleModels(data);
   return [];

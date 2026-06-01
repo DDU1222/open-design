@@ -421,6 +421,10 @@ const API_KEY_CONSOLE_LINKS: Record<ApiProtocol, { host: string; url: string }> 
     host: 'docs.senseaudio.cn',
     url: 'https://docs.senseaudio.cn',
   },
+  aihubmix: {
+    host: 'aihubmix.com',
+    url: 'https://aihubmix.com/token',
+  },
 };
 
 const AGENT_SHORT_DESCRIPTIONS: Record<string, string> = {
@@ -625,11 +629,14 @@ function applyApiProtocolConfig(
     model: apiConfig.model,
     apiProviderBaseUrl: apiConfig.apiProviderBaseUrl ?? null,
     apiVersion: protocol === 'azure' ? (apiConfig.apiVersion ?? '') : '',
-    // byokImageModel is SenseAudio-only — flipping to another BYOK tab
-    // shouldn't carry a SenseAudio image-model choice into, say, the
-    // OpenAI form. Mirrors the apiVersion guarding above.
+    // byokImageModel applies to the protocols that inject the daemon-side
+    // generate_image tool (SenseAudio, AIHubMix) — flipping to another BYOK
+    // tab shouldn't carry an image-model choice into, say, the OpenAI form.
+    // Mirrors the apiVersion guarding above.
     byokImageModel:
-      protocol === 'senseaudio' ? (apiConfig.byokImageModel ?? '') : '',
+      protocol === 'senseaudio' || protocol === 'aihubmix'
+        ? (apiConfig.byokImageModel ?? '')
+        : '',
   };
 }
 
@@ -3513,7 +3520,7 @@ export function SettingsDialog({
                   />
                 </label>
               ) : null}
-              {apiProtocol === 'senseaudio' ? (
+              {apiProtocol === 'senseaudio' || apiProtocol === 'aihubmix' ? (
                 <label className="field">
                   <span className="field-label">{t('settings.byokImageModel')}</span>
                   <select
@@ -3523,15 +3530,15 @@ export function SettingsDialog({
                     }
                   >
                     {/* Default-empty option resolves to the registry default
-                        on the daemon side (senseaudio-image-2.0-260319 today).
+                        on the daemon side (the provider's first image model).
                         Listing it explicitly lets the picker show what the
                         unconfigured state actually means. */}
                     <option value="">
-                      {IMAGE_MODELS.find((m) => m.provider === 'senseaudio')?.label
-                        ?? 'senseaudio-image-2.0'}
+                      {IMAGE_MODELS.find((m) => m.provider === apiProtocol)?.label
+                        ?? 'default'}
                       {' (default)'}
                     </option>
-                    {IMAGE_MODELS.filter((m) => m.provider === 'senseaudio').map(
+                    {IMAGE_MODELS.filter((m) => m.provider === apiProtocol).map(
                       (m) => (
                         <option key={m.id} value={m.id}>
                           {m.label}

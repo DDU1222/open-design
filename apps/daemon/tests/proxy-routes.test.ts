@@ -5,6 +5,7 @@ import path from 'node:path';
 import { afterEach, beforeAll, afterAll, describe, expect, it, vi } from 'vitest';
 import * as platform from '@open-design/platform';
 import { startServer } from '../src/server.js';
+import { AIHUBMIX_APP_CODE } from '../src/aihubmix.js';
 
 type FetchInput = Parameters<typeof fetch>[0];
 type FetchInit = Parameters<typeof fetch>[1];
@@ -1163,6 +1164,51 @@ describe('API proxy routes', () => {
       type: 'function',
       function: { name: 'generate_image' },
     });
+  });
+
+  it('routes AIHubMix to /v1/chat/completions with tools + APP-Code header', async () => {
+    const fetchMock = vi.fn((input: FetchInput, init?: FetchInit) => {
+      const url = String(input);
+      if (url.startsWith(baseUrl)) return realFetch(input, init);
+      return Promise.resolve(sseResponse([
+        'data: {"choices":[{"delta":{"content":"ok"}}]}',
+        '',
+        'data: [DONE]',
+        '',
+      ].join('\n')));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await realFetch(`${baseUrl}/api/proxy/aihubmix/stream`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        baseUrl: 'https://aihubmix.com/v1',
+        apiKey: 'ah-test',
+        projectId: 'test-project',
+        model: 'gpt-4o',
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+
+    const upstreamCall = fetchMock.mock.calls.find(([input]) =>
+      !String(input).startsWith(baseUrl),
+    );
+    expect(upstreamCall).toBeDefined();
+    expect(String(upstreamCall![0])).toBe('https://aihubmix.com/v1/chat/completions');
+    const init = upstreamCall![1] as FetchInit;
+    const body = JSON.parse(String(init?.body));
+    expect(body.tools[0]).toMatchObject({
+      type: 'function',
+      function: { name: 'generate_image' },
+    });
+    const headers = (init?.headers ?? {}) as Record<string, string>;
+    expect(headers.Authorization ?? headers.authorization).toBe('Bearer ah-test');
+    // APP-Code is injected only when the fixed code is configured; the test
+    // stays green either way so an unfilled integrator constant doesn't fail CI.
+    if (AIHUBMIX_APP_CODE) {
+      expect(headers['APP-Code']).toBe(AIHUBMIX_APP_CODE);
+    }
   });
 
   it('runs the BYOK image tool loop end-to-end', async () => {
