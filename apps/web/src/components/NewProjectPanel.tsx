@@ -49,6 +49,10 @@ import {
   VIDEO_LENGTHS_SEC,
   VIDEO_MODELS,
 } from '../media/models';
+import {
+  mergeAihubmixImageModels,
+  useAIHubMixImageModels,
+} from '../media/aihubmix-image-models';
 import { formatPickAndImportFailure } from '../utils/pickAndImportError';
 import { Icon } from './Icon';
 import { Skeleton } from './Loading';
@@ -504,7 +508,9 @@ export function NewProjectPanel({
   function handleImagePromptTemplate(pick: PromptTemplatePick | null) {
     setImagePromptTemplate(pick);
     const m = pick?.summary.model;
-    if (m && IMAGE_MODELS.some((x) => x.id === m)) setImageModel(m);
+    // Accept catalogued ids plus any live AIHubMix catalogue id (aihubmix-*),
+    // which renders dynamically and won't appear in the static IMAGE_MODELS.
+    if (m && (IMAGE_MODELS.some((x) => x.id === m) || m.startsWith('aihubmix-'))) setImageModel(m);
     const a = pick?.summary.aspect;
     if (a && (MEDIA_ASPECTS as readonly string[]).includes(a)) {
       setImageAspect(a as MediaAspect);
@@ -2350,13 +2356,14 @@ function MediaProjectOptions(props:
     }
 ) {
   const t = useT();
+  const aihubmixImageModels = useAIHubMixImageModels();
 
   if (props.surface === 'image') {
     return (
       <div className="newproj-media-options">
         <MediaModelCards
           label={t('newproj.modelLabel')}
-          models={supportedModels('image', IMAGE_MODELS)}
+          models={supportedModels('image', mergeAihubmixImageModels(IMAGE_MODELS, aihubmixImageModels))}
           mediaProviders={props.mediaProviders}
           value={props.imageModel}
           onChange={props.onImageModel}
