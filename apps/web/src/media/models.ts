@@ -269,7 +269,7 @@ export const MEDIA_PROVIDERS: MediaProvider[] = [
     credentialsRequired: true,
     settingsVisible: true,
     defaultBaseUrl: 'https://aihubmix.com/v1',
-    docsUrl: 'https://aihubmix.com/token',
+    docsUrl: 'https://docs.aihubmix.com',
     supportsCustomModel: true,
     customModelPlaceholder: 'gpt-image-1 or dall-e-3',
   },

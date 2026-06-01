@@ -56,6 +56,51 @@ export function aihubmixWireModel(catalogId: string): string {
   return AIHUBMIX_WIRE_MODELS[catalogId] ?? catalogId.replace(/^aihubmix-/, '');
 }
 
+// AIHubMix publishes its catalogue on a NON-OpenAI endpoint:
+//   GET https://aihubmix.com/api/v1/models?type=llm
+//   GET https://aihubmix.com/api/v1/models?type=image_generation
+// (public, no auth required) returning `{ data: [{ model_id, model_name,
+// types, ... }] }` — note `model_id`/`model_name`, not the OpenAI `id`. This
+// lives under the host's `/api/v1` path, not the chat base's `/v1`, so we
+// derive the origin from the configured base URL and append the catalogue path.
+export type AIHubMixCatalogType = 'llm' | 'image_generation';
+
+export function aihubmixCatalogUrl(baseUrl: string, type: AIHubMixCatalogType): string {
+  let origin: string;
+  try {
+    origin = new URL(baseUrl || AIHUBMIX_DEFAULT_BASE_URL).origin;
+  } catch {
+    origin = 'https://aihubmix.com';
+  }
+  return `${origin}/api/v1/models?type=${type}`;
+}
+
+export interface AIHubMixCatalogModel {
+  id: string;
+  label: string;
+}
+
+/** Parse the AIHubMix catalogue envelope into { id, label } options. Reads
+ *  `model_id` (the wire name sent as `model`) and `model_name` (display). */
+export function parseAIHubMixCatalog(data: unknown): AIHubMixCatalogModel[] {
+  const rows = (data as { data?: unknown })?.data;
+  if (!Array.isArray(rows)) return [];
+  const seen = new Set<string>();
+  const out: AIHubMixCatalogModel[] = [];
+  for (const row of rows) {
+    const id = typeof (row as { model_id?: unknown })?.model_id === 'string'
+      ? (row as { model_id: string }).model_id
+      : '';
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const name = typeof (row as { model_name?: unknown })?.model_name === 'string'
+      ? (row as { model_name: string }).model_name
+      : '';
+    out.push({ id, label: name || id });
+  }
+  return out;
+}
+
 // Aspect → pixel size for the chat `generate_image` tool. Tuned for the
 // default model (gpt-image-1, which accepts 1024×1024 / 1536×1024 /
 // 1024×1536). The CLI/media renderer path uses media.ts's model-aware

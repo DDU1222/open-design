@@ -10,7 +10,7 @@ import type {
 import { isLoopbackApiHost } from '@open-design/contracts/api/connectionTest';
 import { redactSecrets, validateBaseUrlResolved } from './connectionTest.js';
 import { googleProviderModelsUrl, normalizeGoogleModelId } from './google-models.js';
-import { aihubmixHeaders } from './aihubmix.js';
+import { aihubmixHeaders, aihubmixCatalogUrl, parseAIHubMixCatalog } from './aihubmix.js';
 
 type ProviderModelsInput = ProviderModelsRequest & {
   signal?: AbortSignal;
@@ -153,7 +153,12 @@ function extractGoogleModels(data: unknown): ProviderModelOption[] {
 }
 
 function providerModelsUrl(protocol: ConnectionTestProtocol, baseUrl: string, apiKey: string): string {
-  if (protocol === 'openai' || protocol === 'senseaudio' || protocol === 'aihubmix') {
+  if (protocol === 'aihubmix') {
+    // AIHubMix exposes its chat catalogue on a dedicated endpoint
+    // (GET /api/v1/models?type=llm), not the OpenAI /v1/models route.
+    return aihubmixCatalogUrl(baseUrl, 'llm');
+  }
+  if (protocol === 'openai' || protocol === 'senseaudio') {
     return appendVersionedApiPath(baseUrl, '/models');
   }
   if (protocol === 'anthropic') {
@@ -190,7 +195,8 @@ function providerModelsHeaders(
 function extractModels(protocol: ConnectionTestProtocol, data: unknown): ProviderModelOption[] {
   // SenseAudio's /v1/models response follows the OpenAI envelope
   // (`{ data: [{ id, ... }] }`), so the same extractor handles both.
-  if (protocol === 'openai' || protocol === 'senseaudio' || protocol === 'aihubmix') return extractOpenAiModels(data);
+  if (protocol === 'aihubmix') return parseAIHubMixCatalog(data);
+  if (protocol === 'openai' || protocol === 'senseaudio') return extractOpenAiModels(data);
   if (protocol === 'anthropic') return extractAnthropicModels(data);
   if (protocol === 'google') return extractGoogleModels(data);
   return [];

@@ -345,6 +345,7 @@ export async function generateMedia(args: {
   // is needed because the fal renderer reads ctx.surface directly.
   let def = findMediaModel(model);
   let isFalCustomPath = false;
+  let isCatalogBypass = false;
   if (!def) {
     if (/^fal-ai\//.test(model)) {
       isFalCustomPath = true;
@@ -354,6 +355,20 @@ export async function generateMedia(args: {
         hint: 'Fal.ai',
         provider: 'fal',
         caps: surface === 'image' ? ['t2i'] : surface === 'video' ? ['t2v'] : [],
+      };
+    } else if (/^aihubmix-/.test(model)) {
+      // AIHubMix image/audio models are discovered live from its catalogue
+      // (GET /api/v1/models?type=image_generation), so most ids are NOT in the
+      // static registry. They all render through the same OpenAI-compatible
+      // endpoint, so synthesize a def on the fly — aihubmixWireModel() strips
+      // the `aihubmix-` prefix to the real wire name inside the renderer.
+      isCatalogBypass = true;
+      def = {
+        id: model,
+        label: model,
+        hint: 'AIHubMix',
+        provider: 'aihubmix',
+        caps: surface === 'image' ? ['t2i', 'i2i'] : surface === 'audio' ? ['tts'] : [],
       };
     } else {
       throw new Error(
@@ -365,7 +380,7 @@ export async function generateMedia(args: {
   // Reject cross-surface combinations for catalogued models.
   const resolvedAudioKind =
     surface === 'audio' ? audioKind || 'music' : undefined;
-  if (!isFalCustomPath) {
+  if (!isFalCustomPath && !isCatalogBypass) {
     const allowed = modelsForSurface(surface, resolvedAudioKind);
     if (!allowed.some((m) => m.id === model)) {
       const ids = allowed.map((m) => m.id).join(', ');

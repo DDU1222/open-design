@@ -3,9 +3,21 @@ import type { MediaExecutionPolicy } from '@open-design/contracts';
 import { defaultMediaExecutionPolicy, mediaPolicyDenial } from './media-policy.js';
 import type { RouteDeps } from './server-context.js';
 import { proxyDispatcherRequestInit } from './connectionTest.js';
+import {
+  aihubmixCatalogUrl,
+  parseAIHubMixCatalog,
+  AIHUBMIX_DEFAULT_BASE_URL,
+  type AIHubMixCatalogType,
+} from './aihubmix.js';
 import type { ToolTokenGrant } from './tool-tokens.js';
 
 const LONG_MEDIA_PROXY_TIMEOUT_MS = 10 * 60 * 1000;
+
+// Short in-memory cache for the AIHubMix media catalogue so the picker can
+// refresh without hammering the upstream public endpoint. Keyed by
+// `${baseUrl}|${type}`. Values expire after AIHUBMIX_CATALOG_TTL_MS.
+const AIHUBMIX_CATALOG_TTL_MS = 5 * 60 * 1000;
+const aihubmixCatalogCache = new Map<string, { at: number; models: Array<{ id: string; label: string }> }>();
 
 export interface RegisterMediaRoutesDeps extends RouteDeps<'db' | 'design' | 'http' | 'paths' | 'ids' | 'auth' | 'media' | 'appConfig' | 'orbit' | 'nativeDialogs' | 'projectStore' | 'projectFiles' | 'conversations' | 'research'> {}
 
@@ -160,6 +172,56 @@ export function registerMediaRoutes(app: Express, ctx: RegisterMediaRoutesDeps) 
       videoLengthsSec: VIDEO_LENGTHS_SEC,
       audioDurationsSec: AUDIO_DURATIONS_SEC,
     });
+  });
+
+  // Live AIHubMix media catalogue. The static IMAGE_MODELS registry only
+  // seeds a couple of AIHubMix entries; the picker calls this to list the full
+  // image-generation catalogue straight from AIHubMix
+  // (GET /api/v1/models?type=image_generation, public). Ids are prefixed
+  // `aihubmix-` so they stay unique and route through the AIHubMix renderer
+  // (which strips the prefix to the wire name). Falls back to the cached copy
+  // on upstream failure so a transient blip doesn't empty the picker.
+  app.get('/api/media/providers/aihubmix/models', async (req, res) => {
+    const type: AIHubMixCatalogType =
+      req.query.type === 'llm' ? 'llm' : 'image_generation';
+    const baseUrl =
+      typeof req.query.baseUrl === 'string' && req.query.baseUrl.trim()
+        ? req.query.baseUrl.trim()
+        : AIHUBMIX_DEFAULT_BASE_URL;
+    const cacheKey = `${baseUrl}|${type}`;
+    const cached = aihubmixCatalogCache.get(cacheKey);
+    if (cached && Date.now() - cached.at < AIHUBMIX_CATALOG_TTL_MS) {
+      return res.json({ ok: true, cached: true, models: cached.models });
+    }
+    const dispatcher = proxyDispatcherRequestInit();
+    try {
+      const resp = await fetch(aihubmixCatalogUrl(baseUrl, type), {
+        ...dispatcher.requestInit,
+        method: 'GET',
+        // The catalogue endpoint is public — no auth header (sending an empty
+        // Bearer would be rejected by some gateways).
+        redirect: 'error',
+        signal: AbortSignal.timeout(15_000),
+      });
+      if (!resp.ok) {
+        if (cached) return res.json({ ok: true, stale: true, models: cached.models });
+        return res.status(502).json({ ok: false, detail: `aihubmix catalog ${resp.status}` });
+      }
+      const data = await resp.json();
+      const models = parseAIHubMixCatalog(data).map((m) => ({
+        id: `aihubmix-${m.id}`,
+        label: m.label,
+      }));
+      aihubmixCatalogCache.set(cacheKey, { at: Date.now(), models });
+      return res.json({ ok: true, models });
+    } catch (err: any) {
+      if (cached) return res.json({ ok: true, stale: true, models: cached.models });
+      return res
+        .status(502)
+        .json({ ok: false, detail: String(err && err.message ? err.message : err) });
+    } finally {
+      await dispatcher.close();
+    }
   });
 
   app.get('/api/media/config', async (_req, res) => {

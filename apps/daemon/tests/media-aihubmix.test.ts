@@ -22,6 +22,8 @@ import {
   AIHUBMIX_DEFAULT_BASE_URL,
   aihubmixHeaders,
   aihubmixWireModel,
+  aihubmixCatalogUrl,
+  parseAIHubMixCatalog,
 } from '../src/aihubmix.js';
 
 // 1×1 transparent PNG.
@@ -54,6 +56,28 @@ describe('aihubmix shared helpers', () => {
 
   it('defaults to the aihubmix.com/v1 base url', () => {
     expect(AIHUBMIX_DEFAULT_BASE_URL).toBe('https://aihubmix.com/v1');
+  });
+
+  it('builds the live catalogue url from the base origin', () => {
+    expect(aihubmixCatalogUrl('https://aihubmix.com/v1', 'llm'))
+      .toBe('https://aihubmix.com/api/v1/models?type=llm');
+    expect(aihubmixCatalogUrl('https://aihubmix.com/v1', 'image_generation'))
+      .toBe('https://aihubmix.com/api/v1/models?type=image_generation');
+  });
+
+  it('parses the AIHubMix catalogue envelope (model_id / model_name)', () => {
+    const parsed = parseAIHubMixCatalog({
+      data: [
+        { model_id: 'gpt-image-2', model_name: 'GPT Image 2', types: 'image_generation,llm' },
+        { model_id: 'qwen-image-2.0-pro', model_name: '', types: 'image_generation' },
+        { model_id: 'gpt-image-2' }, // duplicate id dropped
+        { foo: 'bar' }, // no model_id dropped
+      ],
+    });
+    expect(parsed).toEqual([
+      { id: 'gpt-image-2', label: 'GPT Image 2' },
+      { id: 'qwen-image-2.0-pro', label: 'qwen-image-2.0-pro' }, // falls back to id
+    ]);
   });
 });
 
@@ -120,6 +144,32 @@ describe('aihubmix media generation', () => {
 
     const bytes = await readFile(path.join(projectsRoot, 'project-1', 'fox.png'));
     expect(bytes.length).toBeGreaterThan(0);
+  });
+
+  it('renders a dynamic catalogue image id not in the static registry', async () => {
+    // aihubmix-qwen-image-2.0-pro is NOT in IMAGE_MODELS — it comes from the
+    // live catalogue. generateMedia must synthesize a def and strip the prefix
+    // to the wire name rather than throwing "unknown model".
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      jsonResp({ data: [{ b64_json: FAKE_PNG.toString('base64') }] }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await generateMedia({
+      surface: 'image',
+      model: 'aihubmix-qwen-image-2.0-pro',
+      prompt: 'a koi pond, ukiyo-e',
+      aspect: '1:1',
+      output: 'koi.png',
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+    });
+
+    expect(result.providerId).toBe('aihubmix');
+    const [url, opts] = fetchMock.mock.calls[0]!;
+    expect(String(url)).toBe('https://aihubmix.com/v1/images/generations');
+    expect(JSON.parse(opts.body).model).toBe('qwen-image-2.0-pro');
   });
 
   it('renders speech via /v1/audio/speech with the stripped wire model', async () => {

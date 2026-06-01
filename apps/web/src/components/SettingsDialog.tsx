@@ -423,7 +423,7 @@ const API_KEY_CONSOLE_LINKS: Record<ApiProtocol, { host: string; url: string }> 
   },
   aihubmix: {
     host: 'aihubmix.com',
-    url: 'https://aihubmix.com/token',
+    url: 'https://console.aihubmix.com/token',
   },
 };
 
