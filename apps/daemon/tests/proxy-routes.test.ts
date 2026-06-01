@@ -1211,6 +1211,90 @@ describe('API proxy routes', () => {
     }
   });
 
+  it('routes AIHubMix claude* models to the Anthropic /v1/messages wire', async () => {
+    const fetchMock = vi.fn((input: FetchInput, init?: FetchInit) => {
+      const url = String(input);
+      if (url.startsWith(baseUrl)) return realFetch(input, init);
+      return Promise.resolve(sseResponse([
+        'event: message_stop',
+        'data: {"type":"message_stop"}',
+        '',
+      ].join('\n')));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await realFetch(`${baseUrl}/api/proxy/aihubmix/stream`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        baseUrl: 'https://aihubmix.com/v1',
+        apiKey: 'ah-test',
+        projectId: 'test-project',
+        model: 'claude-opus-4-8',
+        systemPrompt: 'be brief',
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+
+    const upstreamCall = fetchMock.mock.calls.find(([input]) =>
+      !String(input).startsWith(baseUrl),
+    );
+    expect(upstreamCall).toBeDefined();
+    // Anthropic native endpoint on the AIHubMix origin, not /v1/chat/completions.
+    expect(String(upstreamCall![0])).toBe('https://aihubmix.com/v1/messages');
+    const init = upstreamCall![1] as FetchInit;
+    const headers = (init?.headers ?? {}) as Record<string, string>;
+    expect(headers['x-api-key']).toBe('ah-test');
+    expect(headers['anthropic-version']).toBe('2023-06-01');
+    const body = JSON.parse(String(init?.body));
+    expect(body.system).toBe('be brief'); // Anthropic-shaped (not OpenAI messages[system])
+    expect(body.tools).toBeUndefined(); // base chat — no tool loop on the claude route
+    if (AIHUBMIX_APP_CODE) {
+      expect(headers['APP-Code']).toBe(AIHUBMIX_APP_CODE);
+    }
+  });
+
+  it('routes AIHubMix gemini* models to the Gemini streamGenerateContent wire', async () => {
+    const fetchMock = vi.fn((input: FetchInput, init?: FetchInit) => {
+      const url = String(input);
+      if (url.startsWith(baseUrl)) return realFetch(input, init);
+      return Promise.resolve(sseResponse([
+        'data: {"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}',
+        '',
+      ].join('\n')));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await realFetch(`${baseUrl}/api/proxy/aihubmix/stream`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        baseUrl: 'https://aihubmix.com/v1',
+        apiKey: 'ah-test',
+        projectId: 'test-project',
+        model: 'gemini-2.0-flash',
+        messages: [{ role: 'user', content: 'hi' }],
+      }),
+    });
+
+    const upstreamCall = fetchMock.mock.calls.find(([input]) =>
+      !String(input).startsWith(baseUrl),
+    );
+    expect(upstreamCall).toBeDefined();
+    // Gemini native endpoint under the /gemini sub-path of the AIHubMix origin.
+    expect(String(upstreamCall![0])).toBe(
+      'https://aihubmix.com/gemini/v1beta/models/gemini-2.0-flash:streamGenerateContent?alt=sse',
+    );
+    const init = upstreamCall![1] as FetchInit;
+    const headers = (init?.headers ?? {}) as Record<string, string>;
+    expect(headers['x-goog-api-key']).toBe('ah-test');
+    const body = JSON.parse(String(init?.body));
+    expect(Array.isArray(body.contents)).toBe(true); // Gemini-shaped
+    if (AIHUBMIX_APP_CODE) {
+      expect(headers['APP-Code']).toBe(AIHUBMIX_APP_CODE);
+    }
+  });
+
   it('runs the BYOK image tool loop end-to-end', async () => {
     const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01]);
     const upstreamChatBodies: any[] = [];

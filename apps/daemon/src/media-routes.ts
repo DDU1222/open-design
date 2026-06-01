@@ -182,8 +182,11 @@ export function registerMediaRoutes(app: Express, ctx: RegisterMediaRoutesDeps) 
   // (which strips the prefix to the wire name). Falls back to the cached copy
   // on upstream failure so a transient blip doesn't empty the picker.
   app.get('/api/media/providers/aihubmix/models', async (req, res) => {
+    const raw = req.query.type;
     const type: AIHubMixCatalogType =
-      req.query.type === 'llm' ? 'llm' : 'image_generation';
+      raw === 'llm' || raw === 'video' || raw === 'tts'
+        ? raw
+        : 'image_generation';
     const baseUrl =
       typeof req.query.baseUrl === 'string' && req.query.baseUrl.trim()
         ? req.query.baseUrl.trim()

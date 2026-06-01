@@ -41,6 +41,54 @@ export function aihubmixHeaders(apiKey: string): Record<string, string> {
   return headers;
 }
 
+/**
+ * The APP-Code attribution header on its own (no auth). For the Anthropic /
+ * Gemini routes, which carry their own auth header (`x-api-key` /
+ * `x-goog-api-key`) — spread this alongside it so every AIHubMix request,
+ * whatever the wire protocol, still carries APP-Code.
+ */
+export function aihubmixAppCodeHeader(): Record<string, string> {
+  return AIHUBMIX_APP_CODE ? { 'APP-Code': AIHUBMIX_APP_CODE } : {};
+}
+
+// Model-name → upstream protocol routing (AIHubMix integration guide §4.3).
+// AIHubMix dispatches by model name on its side, but for native fidelity
+// (claude thinking, gemini-specific features, imagen) the recommended client
+// pattern is to call each family on its native wire/endpoint rather than the
+// unified OpenAI endpoint. We classify here and route in the chat proxy +
+// media renderer.
+export type AIHubMixProtocol = 'openai' | 'anthropic' | 'gemini';
+
+export function classifyAIHubMixModel(model: string): AIHubMixProtocol {
+  const m = (model || '').trim().toLowerCase();
+  // Gemini: gemini*/imagen*, excluding the `-nothink`/`-search` suffixes and
+  // any embedding model (those stay on the OpenAI-compatible path per §4.1).
+  if (
+    (m.startsWith('gemini') || m.startsWith('imagen'))
+    && !/-(nothink|search)$/.test(m)
+    && !m.includes('embedding')
+  ) {
+    return 'gemini';
+  }
+  if (m.startsWith('claude')) return 'anthropic';
+  return 'openai';
+}
+
+/**
+ * Origin of the configured AIHubMix base URL — the three protocol clients all
+ * derive their endpoint from it:
+ *   openai    → `${origin}/v1`
+ *   anthropic → `${origin}` (+ /v1/messages)
+ *   gemini    → `${origin}/gemini` (+ /v1beta/models/{model}:...)
+ */
+export function aihubmixOriginFromBase(baseUrl: string): string {
+  try {
+    return new URL(baseUrl || AIHUBMIX_DEFAULT_BASE_URL).origin;
+  } catch {
+    return 'https://aihubmix.com';
+  }
+}
+
 // Catalogue ids vs wire names. The media registry requires globally-unique
 // model ids, but `gpt-image-1` / `dall-e-3` / `tts-1` are already owned by the
 // `openai` provider. So AIHubMix's models are registered with an `aihubmix-`
@@ -63,7 +111,7 @@ export function aihubmixWireModel(catalogId: string): string {
 // types, ... }] }` — note `model_id`/`model_name`, not the OpenAI `id`. This
 // lives under the host's `/api/v1` path, not the chat base's `/v1`, so we
 // derive the origin from the configured base URL and append the catalogue path.
-export type AIHubMixCatalogType = 'llm' | 'image_generation';
+export type AIHubMixCatalogType = 'llm' | 'image_generation' | 'tts' | 'video';
 
 export function aihubmixCatalogUrl(baseUrl: string, type: AIHubMixCatalogType): string {
   let origin: string;

@@ -1,53 +1,73 @@
-// Live AIHubMix image-model catalogue for the media pickers.
+// Live AIHubMix model catalogues for the media pickers.
 //
-// The static IMAGE_MODELS registry only seeds a couple of AIHubMix entries.
-// AIHubMix actually exposes ~50 image models that change over time, so the
-// pickers fetch the live list from the daemon
-// (GET /api/media/providers/aihubmix/models?type=image_generation, which
-// proxies AIHubMix's public catalogue and prefixes ids `aihubmix-`). The
-// fetched ids render through the same OpenAI-compatible AIHubMix renderer, so
-// no per-model wiring is needed.
+// The static IMAGE_MODELS / VIDEO_MODELS / AUDIO_MODELS_BY_KIND registries only
+// seed a couple of AIHubMix entries. AIHubMix actually exposes a much larger,
+// changing catalogue per surface, so the pickers fetch the live list from the
+// daemon (GET /api/media/providers/aihubmix/models?type=<catalog>, which proxies
+// AIHubMix's public catalogue and prefixes ids `aihubmix-`). The fetched ids all
+// render through the same OpenAI-compatible AIHubMix renderers, so no per-model
+// wiring is needed.
 //
-// The result is cached at module scope (one fetch per page load) and exposed
-// via a hook so every image picker shows the same list without each surface
+//   surface image          -> type=image_generation -> caps t2i/i2i
+//   surface video          -> type=video            -> caps t2v/i2v
+//   surface audio (speech) -> type=tts              -> caps tts
+//
+// Results are cached at module scope (one fetch per catalogue per page load) and
+// exposed via hooks so every picker shows the same list without each surface
 // issuing its own request.
 import { useEffect, useMemo, useState } from 'react';
 import { IMAGE_MODELS, type MediaModel } from './models';
 
 type FetchedModel = { id: string; label: string };
 
-function toMediaModel(m: FetchedModel): MediaModel {
+export type AIHubMixCatalogType = 'image_generation' | 'video' | 'tts';
+
+const CAPS_BY_TYPE: Record<AIHubMixCatalogType, string[]> = {
+  image_generation: ['t2i', 'i2i'],
+  video: ['t2v', 'i2v'],
+  tts: ['tts'],
+};
+
+function toMediaModel(m: FetchedModel, type: AIHubMixCatalogType): MediaModel {
   return {
     id: m.id,
     label: m.label,
     hint: 'AIHubMix',
     provider: 'aihubmix',
-    caps: ['t2i', 'i2i'],
+    caps: CAPS_BY_TYPE[type],
   };
 }
 
-export async function fetchAIHubMixImageModels(
+export async function fetchAIHubMixModels(
+  type: AIHubMixCatalogType,
   signal?: AbortSignal,
 ): Promise<MediaModel[]> {
   const res = await fetch(
-    '/api/media/providers/aihubmix/models?type=image_generation',
+    `/api/media/providers/aihubmix/models?type=${type}`,
     { signal },
   );
-  if (!res.ok) throw new Error(`aihubmix image catalog ${res.status}`);
+  if (!res.ok) throw new Error(`aihubmix ${type} catalog ${res.status}`);
   const payload = (await res.json()) as { models?: FetchedModel[] };
   const rows = Array.isArray(payload?.models) ? payload.models : [];
   return rows
     .filter((m) => typeof m?.id === 'string' && m.id)
-    .map(toMediaModel);
+    .map((m) => toMediaModel(m, type));
+}
+
+/** Back-compat alias: the original image-only fetch helper. */
+export function fetchAIHubMixImageModels(
+  signal?: AbortSignal,
+): Promise<MediaModel[]> {
+  return fetchAIHubMixModels('image_generation', signal);
 }
 
 /**
- * Merge the live AIHubMix image list into a base IMAGE_MODELS array: drop the
- * static `aihubmix` seeds and append the fetched list. When the fetch hasn't
- * resolved (or failed), `dynamic` is empty and the base seeds are kept, so the
- * picker is never empty for AIHubMix.
+ * Merge a live AIHubMix list into a base registry array: drop the static
+ * `aihubmix` seeds and append the fetched list. When the fetch hasn't resolved
+ * (or failed), `dynamic` is empty and the base seeds are kept, so the picker is
+ * never empty for AIHubMix. Surface-agnostic — keys only on provider.
  */
-export function mergeAihubmixImageModels(
+export function mergeAihubmixModels(
   base: MediaModel[],
   dynamic: MediaModel[],
 ): MediaModel[] {
@@ -56,38 +76,46 @@ export function mergeAihubmixImageModels(
   return [...withoutSeeds, ...dynamic];
 }
 
-// Module-scope cache so multiple pickers mounting in the same session share one
-// network request. The promise is memoized; a failed fetch resets it so a later
-// mount can retry.
-let cachedModels: MediaModel[] = [];
-let inFlight: Promise<MediaModel[]> | null = null;
+/** Back-compat alias for the image picker call sites. */
+export const mergeAihubmixImageModels = mergeAihubmixModels;
 
-function loadOnce(): Promise<MediaModel[]> {
-  if (cachedModels.length) return Promise.resolve(cachedModels);
-  if (!inFlight) {
-    inFlight = fetchAIHubMixImageModels()
+// Module-scope cache, bucketed per catalogue type, so multiple pickers mounting
+// in the same session share one network request per type. The in-flight promise
+// is memoized; a failed fetch clears it so a later mount can retry.
+const cachedModels = new Map<AIHubMixCatalogType, MediaModel[]>();
+const inFlight = new Map<AIHubMixCatalogType, Promise<MediaModel[]>>();
+
+function loadOnce(type: AIHubMixCatalogType): Promise<MediaModel[]> {
+  const cached = cachedModels.get(type);
+  if (cached && cached.length) return Promise.resolve(cached);
+  let pending = inFlight.get(type);
+  if (!pending) {
+    pending = fetchAIHubMixModels(type)
       .then((models) => {
-        cachedModels = models;
+        cachedModels.set(type, models);
         return models;
       })
       .catch((err) => {
-        inFlight = null; // allow retry on next mount
+        inFlight.delete(type); // allow retry on next mount
         throw err;
       });
+    inFlight.set(type, pending);
   }
-  return inFlight;
+  return pending;
 }
 
 /**
- * Hook returning the live AIHubMix image models (empty until the first fetch
- * resolves). Safe to call from any image picker; the underlying request is
- * shared across mounts.
+ * Hook returning the live AIHubMix models for one catalogue type (empty until
+ * the first fetch resolves). Safe to call from any picker; the underlying
+ * request is shared across mounts.
  */
-export function useAIHubMixImageModels(): MediaModel[] {
-  const [models, setModels] = useState<MediaModel[]>(cachedModels);
+export function useAIHubMixModels(type: AIHubMixCatalogType): MediaModel[] {
+  const [models, setModels] = useState<MediaModel[]>(
+    () => cachedModels.get(type) ?? [],
+  );
   useEffect(() => {
     let active = true;
-    loadOnce()
+    loadOnce(type)
       .then((fetched) => {
         if (active) setModels(fetched);
       })
@@ -97,8 +125,23 @@ export function useAIHubMixImageModels(): MediaModel[] {
     return () => {
       active = false;
     };
-  }, []);
+  }, [type]);
   return models;
+}
+
+/** Live AIHubMix image-generation models. */
+export function useAIHubMixImageModels(): MediaModel[] {
+  return useAIHubMixModels('image_generation');
+}
+
+/** Live AIHubMix video models. */
+export function useAIHubMixVideoModels(): MediaModel[] {
+  return useAIHubMixModels('video');
+}
+
+/** Live AIHubMix speech (TTS) models. */
+export function useAIHubMixAudioModels(): MediaModel[] {
+  return useAIHubMixModels('tts');
 }
 
 /**
@@ -115,7 +158,7 @@ export function useByokImageModelOptions(
   const dynamic = useAIHubMixImageModels();
   return useMemo(() => {
     if (provider === 'aihubmix') {
-      return mergeAihubmixImageModels(IMAGE_MODELS, dynamic).filter(
+      return mergeAihubmixModels(IMAGE_MODELS, dynamic).filter(
         (m) => m.provider === 'aihubmix',
       );
     }

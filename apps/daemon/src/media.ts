@@ -368,7 +368,14 @@ export async function generateMedia(args: {
         label: model,
         hint: 'AIHubMix',
         provider: 'aihubmix',
-        caps: surface === 'image' ? ['t2i', 'i2i'] : surface === 'audio' ? ['tts'] : [],
+        caps:
+          surface === 'image'
+            ? ['t2i', 'i2i']
+            : surface === 'video'
+              ? ['t2v', 'i2v']
+              : surface === 'audio'
+                ? ['tts']
+                : [],
       };
     } else {
       throw new Error(
@@ -534,6 +541,11 @@ export async function generateMedia(args: {
       && ctx.audioKind === 'speech'
     ) {
       const result = await renderAIHubMixTTS(ctx, credentials, safeOut);
+      bytes = result.bytes;
+      providerNote = result.providerNote;
+      suggestedExt = result.suggestedExt;
+    } else if (def.provider === 'aihubmix' && surface === 'video') {
+      const result = await renderAIHubMixVideo(ctx, credentials, args.onProgress);
       bytes = result.bytes;
       providerNote = result.providerNote;
       suggestedExt = result.suggestedExt;
@@ -2983,6 +2995,154 @@ async function renderAIHubMixTTS(ctx: MediaContext, credentials: ProviderConfig,
     bytes,
     providerNote: `aihubmix/${wireModel} · ${voice} · ${format} · ${bytes.length} bytes`,
     suggestedExt: format === 'opus' ? '.ogg' : `.${format}`,
+  };
+}
+
+// AIHubMix video uses the OpenAI Sora-style async `/v1/videos` API (NOT the
+// `/videos/generations` synchronous shape some gateways expose): POST to submit
+// a job, GET `/v1/videos/{id}` to poll status, then GET `/v1/videos/{id}/content`
+// to download the finished MP4. `aspect` maps to a concrete `size` string.
+function aihubmixVideoSizeFor(aspect: string | undefined): string {
+  switch (aspect) {
+    case '9:16':
+      return '720x1280';
+    case '1:1':
+      return '1024x1024';
+    case '4:3':
+      return '960x720';
+    case '3:4':
+      return '720x960';
+    case '16:9':
+    default:
+      return '1280x720';
+  }
+}
+
+async function renderAIHubMixVideo(
+  ctx: MediaContext,
+  credentials: ProviderConfig,
+  onProgress?: ProgressFn,
+): Promise<RenderResult> {
+  if (!credentials.apiKey) {
+    throw new Error('no AIHubMix API key — configure it in Settings or set OD_AIHUBMIX_API_KEY');
+  }
+  const baseUrl = (credentials.baseUrl || AIHUBMIX_DEFAULT_BASE_URL).replace(/\/$/, '');
+  const wireModel = aihubmixWireModel(credentials.model || ctx.wireModel);
+  const size = aihubmixVideoSizeFor(ctx.aspect);
+  const seconds = String(ctx.length || 5);
+
+  const body: Record<string, unknown> = {
+    model: wireModel,
+    prompt: ctx.prompt || 'A short cinematic clip.',
+    size,
+    seconds,
+  };
+  // First-frame reference for i2v flows; AIHubMix accepts a data URL.
+  if (ctx.imageRef?.dataUrl) {
+    body.input_reference = ctx.imageRef.dataUrl;
+  }
+
+  const submitResp = await fetch(`${baseUrl}/videos`, withMediaRequestInit(ctx, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', ...aihubmixHeaders(credentials.apiKey) },
+    body: JSON.stringify(body),
+  }));
+  const submitText = await submitResp.text();
+  if (!submitResp.ok) {
+    throw new Error(`aihubmix video submit ${submitResp.status}: ${truncate(submitText, 240)}`);
+  }
+  let submitData: any;
+  try {
+    submitData = JSON.parse(submitText);
+  } catch {
+    throw new Error(`aihubmix video non-JSON: ${truncate(submitText, 200)}`);
+  }
+  const taskId = submitData?.id || submitData?.data?.id;
+  if (!taskId) throw new Error('aihubmix video response missing id');
+
+  // Poll until completed/failed. Sora-class generations routinely take a few
+  // minutes; match the Volcengine ceiling (12 min, env-overridable). Emit a
+  // heartbeat each tick so the agent's bash watchdog never marks the call hung.
+  const startedAt = Date.now();
+  const configuredMaxMs = Number(process.env.OD_AIHUBMIX_VIDEO_MAX_POLL_MS);
+  const maxMs =
+    Number.isFinite(configuredMaxMs) && configuredMaxMs >= 60_000
+      ? configuredMaxMs
+      : 12 * 60 * 1000;
+  if (typeof onProgress === 'function') {
+    const mode = ctx.imageRef ? 'i2v' : 't2v';
+    onProgress(`aihubmix ${mode} video task ${taskId} accepted; polling status…`);
+  }
+  let lastStatus = '';
+  let directUrl: string | null = null;
+  let done = false;
+  while (Date.now() - startedAt < maxMs) {
+    await sleep(4000);
+    const pollResp = await fetch(`${baseUrl}/videos/${encodeURIComponent(taskId)}`, withMediaRequestInit(ctx, {
+      headers: { ...aihubmixHeaders(credentials.apiKey) },
+    }));
+    const pollText = await pollResp.text();
+    if (!pollResp.ok) {
+      throw new Error(`aihubmix video poll ${pollResp.status}: ${truncate(pollText, 240)}`);
+    }
+    let pollData: any;
+    try {
+      pollData = JSON.parse(pollText);
+    } catch {
+      throw new Error(`aihubmix video poll non-JSON: ${truncate(pollText, 200)}`);
+    }
+    lastStatus = pollData?.status || pollData?.data?.status || '';
+    if (typeof onProgress === 'function') {
+      const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
+      onProgress(`aihubmix video task ${taskId} status=${lastStatus || 'pending'} (elapsed ${elapsedSec}s)`);
+    }
+    if (lastStatus === 'completed' || lastStatus === 'succeeded' || lastStatus === 'done') {
+      // Some gateways surface the asset URL inline; otherwise fall back to the
+      // /content download endpoint below.
+      directUrl =
+        pollData?.video_url
+        || pollData?.url
+        || pollData?.output_url
+        || pollData?.data?.video_url
+        || pollData?.data?.url
+        || (Array.isArray(pollData?.data) ? pollData.data[0]?.url : null)
+        || null;
+      done = true;
+      break;
+    }
+    if (lastStatus === 'failed' || lastStatus === 'cancelled' || lastStatus === 'error') {
+      const reason = pollData?.error?.message || pollData?.error || lastStatus;
+      throw new Error(`aihubmix video task ${lastStatus}: ${truncate(reason, 200)}`);
+    }
+  }
+  if (!done) {
+    throw new Error(`aihubmix video did not finish in time (last status: ${lastStatus || 'unknown'})`);
+  }
+
+  let bytes: Buffer;
+  if (directUrl) {
+    const urlCheck = await assertExternalAssetUrl(directUrl);
+    if (!urlCheck.ok) throw new Error(urlCheck.error);
+    const dl = await fetch(directUrl, withMediaRequestInit(ctx));
+    if (!dl.ok) throw new Error(`aihubmix video fetch ${dl.status}`);
+    bytes = Buffer.from(await dl.arrayBuffer());
+  } else {
+    const contentResp = await fetch(`${baseUrl}/videos/${encodeURIComponent(taskId)}/content`, withMediaRequestInit(ctx, {
+      headers: { ...aihubmixHeaders(credentials.apiKey) },
+    }));
+    if (!contentResp.ok) {
+      throw new Error(`aihubmix video content ${contentResp.status}`);
+    }
+    bytes = Buffer.from(await contentResp.arrayBuffer());
+  }
+  if (bytes.length === 0) {
+    throw new Error('aihubmix video returned zero bytes');
+  }
+
+  return {
+    bytes,
+    providerNote: `aihubmix/${wireModel} · ${size} · ${seconds}s · ${bytes.length} bytes`,
+    suggestedExt: '.mp4',
   };
 }
 

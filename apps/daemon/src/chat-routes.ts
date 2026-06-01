@@ -20,7 +20,13 @@ import {
   type BYOKToolContext,
   type ImageToolResult,
 } from './byok-tools.js';
-import { AIHUBMIX_DEFAULT_BASE_URL, aihubmixHeaders } from './aihubmix.js';
+import {
+  AIHUBMIX_DEFAULT_BASE_URL,
+  aihubmixHeaders,
+  aihubmixAppCodeHeader,
+  aihubmixOriginFromBase,
+  classifyAIHubMixModel,
+} from './aihubmix.js';
 import { isSafeId as isSafeProjectId } from './projects.js';
 import { projectKindToTracking } from '@open-design/contracts/analytics';
 import { proxyDispatcherRequestInit, validateBaseUrlResolved } from './connectionTest.js';
@@ -675,6 +681,188 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
     };
   }
 
+  // ---- Reusable base-chat streamers (text only — no tool loop) -------------
+  // Both the native /api/proxy/{anthropic,google}/stream routes AND the
+  // AIHubMix model-routed proxy call these. Only the resolved url + headers
+  // differ (AIHubMix adds the APP-Code header and a different origin), so the
+  // wire/SSE handling lives here once. The OpenAI tool loop stays in
+  // registerByokToolChatProxy.
+
+  const buildAnthropicChatPayload = (
+    model: string,
+    systemPrompt: unknown,
+    messages: unknown,
+    maxTokens: unknown,
+  ) => {
+    const payload: any = {
+      model,
+      max_tokens:
+        typeof maxTokens === 'number' && maxTokens > 0 ? maxTokens : 8192,
+      messages: Array.isArray(messages) ? messages : [],
+      stream: true,
+    };
+    if (typeof systemPrompt === 'string' && systemPrompt) {
+      payload.system = systemPrompt;
+    }
+    return payload;
+  };
+
+  const runAnthropicChatStream = async (
+    res: any,
+    opts: { url: string; headers: Record<string, string>; payload: any; logTag: string },
+  ) => {
+    const sse = createSseResponse(res);
+    let proxyDispatcher: ReturnType<typeof proxyDispatcherRequestInit> | null = null;
+    try {
+      proxyDispatcher = proxyDispatcherRequestInit();
+      sse.send('start', { model: opts.payload?.model });
+      const response = await fetch(opts.url, {
+        ...proxyDispatcher.requestInit,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...opts.headers },
+        body: JSON.stringify(opts.payload),
+        redirect: 'error',
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error(
+          `[${opts.logTag}] upstream error: ${response.status} ${redactAuthTokens(errorText)}`,
+        );
+        sendProxyError(sse, `Upstream error: ${response.status}`, {
+          code: proxyErrorCode(response.status),
+          details: errorText,
+          retryable: response.status === 429 || response.status >= 500,
+        });
+        return sse.end();
+      }
+
+      let ended = false;
+      const guard = createDeltaGuard(sse);
+      await streamUpstreamSse(response, ({ event, data }: any) => {
+        if (!data) return false;
+        if (event === 'error' || data.type === 'error') {
+          const message = data.error?.message || data.message || 'Anthropic upstream error';
+          sendProxyError(sse, message, { details: data });
+          ended = true;
+          return true;
+        }
+        if (event === 'content_block_delta' && typeof data.delta?.text === 'string') {
+          guard.sendDelta(data.delta.text);
+          if (guard.contaminated) {
+            sse.send('end', {});
+            ended = true;
+            return true;
+          }
+        }
+        if (event === 'message_stop') {
+          sse.send('end', {});
+          ended = true;
+          return true;
+        }
+        return false;
+      });
+      if (!ended) sse.send('end', {});
+      sse.end();
+    } catch (err: any) {
+      console.error(`[${opts.logTag}] internal error: ${err.message}`);
+      sendProxyError(sse, err.message, { code: 'INTERNAL_ERROR' });
+      sse.end();
+    } finally {
+      await proxyDispatcher?.close();
+    }
+  };
+
+  const buildGeminiChatPayload = (
+    systemPrompt: unknown,
+    messages: unknown,
+    maxTokens: unknown,
+  ) => {
+    const contents = (Array.isArray(messages) ? messages : []).map((message: any) => ({
+      role: message.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: message.content }],
+    }));
+    const payload: any = {
+      contents,
+      generationConfig: {
+        maxOutputTokens:
+          typeof maxTokens === 'number' && maxTokens > 0 ? maxTokens : 8192,
+      },
+    };
+    if (typeof systemPrompt === 'string' && systemPrompt) {
+      payload.systemInstruction = { parts: [{ text: systemPrompt }] };
+    }
+    return payload;
+  };
+
+  const runGeminiChatStream = async (
+    res: any,
+    opts: { url: string; headers: Record<string, string>; payload: any; model: string; logTag: string },
+  ) => {
+    const sse = createSseResponse(res);
+    let proxyDispatcher: ReturnType<typeof proxyDispatcherRequestInit> | null = null;
+    try {
+      proxyDispatcher = proxyDispatcherRequestInit();
+      sse.send('start', { model: opts.model });
+      const response = await fetch(opts.url, {
+        ...proxyDispatcher.requestInit,
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...opts.headers },
+        body: JSON.stringify(opts.payload),
+        redirect: 'error',
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        console.error(
+          `[${opts.logTag}] upstream error: ${response.status} ${redactAuthTokens(errorText)}`,
+        );
+        sendProxyError(sse, `Upstream error: ${response.status}`, {
+          code: proxyErrorCode(response.status),
+          details: errorText,
+          retryable: response.status === 429 || response.status >= 500,
+        });
+        return sse.end();
+      }
+
+      let ended = false;
+      const guard = createDeltaGuard(sse);
+      await streamUpstreamSse(response, ({ data }: any) => {
+        if (!data) return false;
+        const streamError = extractStreamErrorMessage(data);
+        if (streamError) {
+          sendProxyError(sse, `Gemini error: ${streamError}`, { details: data });
+          ended = true;
+          return true;
+        }
+        const delta = extractGeminiText(data);
+        if (delta) {
+          guard.sendDelta(delta);
+          if (guard.contaminated) {
+            sse.send('end', {});
+            ended = true;
+            return true;
+          }
+        }
+        const blockMessage = extractGeminiBlockMessage(data);
+        if (blockMessage) {
+          sendProxyError(sse, blockMessage, { details: data });
+          ended = true;
+          return true;
+        }
+        return false;
+      });
+      if (!ended) sse.send('end', {});
+      sse.end();
+    } catch (err: any) {
+      console.error(`[${opts.logTag}] internal error: ${err.message}`);
+      sendProxyError(sse, err.message, { code: 'INTERNAL_ERROR' });
+      sse.end();
+    } finally {
+      await proxyDispatcher?.close();
+    }
+  };
+
   app.post('/api/proxy/anthropic/stream', async (req, res) => {
     /** @type {Partial<ProxyStreamRequest>} */
     const proxyBody = req.body || {};
@@ -705,81 +893,12 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
       `[proxy:anthropic] ${req.method} ${validated.parsed!.hostname} model=${model}`,
     );
 
-    const payload: any = {
-      model,
-      max_tokens:
-        typeof maxTokens === 'number' && maxTokens > 0 ? maxTokens : 8192,
-      messages: Array.isArray(messages) ? messages : [],
-      stream: true,
-    };
-    if (typeof systemPrompt === 'string' && systemPrompt) {
-      payload.system = systemPrompt;
-    }
-
-    const sse = createSseResponse(res);
-    let proxyDispatcher: ReturnType<typeof proxyDispatcherRequestInit> | null = null;
-    try {
-      proxyDispatcher = proxyDispatcherRequestInit();
-      sse.send('start', { model });
-      const response = await fetch(url, {
-        ...proxyDispatcher.requestInit,
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-        },
-        body: JSON.stringify(payload),
-        redirect: 'error',
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error(
-          `[proxy:anthropic] upstream error: ${response.status} ${redactAuthTokens(errorText)}`,
-        );
-        sendProxyError(sse, `Upstream error: ${response.status}`, {
-          code: proxyErrorCode(response.status),
-          details: errorText,
-          retryable: response.status === 429 || response.status >= 500,
-        });
-        return sse.end();
-      }
-
-      let ended = false;
-      const guard = createDeltaGuard(sse);
-      await streamUpstreamSse(response, ({ event, data }: any) => {
-        if (!data) return false;
-        if (event === 'error' || data.type === 'error') {
-          const message = data.error?.message || data.message || 'Anthropic upstream error';
-          sendProxyError(sse, message, { details: data });
-          ended = true;
-          return true;
-        }
-        if (event === 'content_block_delta' && typeof data.delta?.text === 'string') {
-          guard.sendDelta(data.delta.text);
-          if (guard.contaminated) { 
-            sse.send('end', {}); 
-            ended = true; 
-            return true; 
-          }
-        }
-        if (event === 'message_stop') {
-          sse.send('end', {});
-          ended = true;
-          return true;
-        }
-        return false;
-      });
-      if (!ended) sse.send('end', {});
-      sse.end();
-    } catch (err: any) {
-      console.error(`[proxy:anthropic] internal error: ${err.message}`);
-      sendProxyError(sse, err.message, { code: 'INTERNAL_ERROR' });
-      sse.end();
-    } finally {
-      await proxyDispatcher?.close();
-    }
+    return runAnthropicChatStream(res, {
+      url,
+      headers: { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
+      payload: buildAnthropicChatPayload(model, systemPrompt, messages, maxTokens),
+      logTag: 'proxy:anthropic',
+    });
   });
 
   app.post('/api/proxy/openai/stream', async (req, res) => {
@@ -1081,85 +1200,13 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
       `[proxy:google] ${req.method} ${validated.parsed!.hostname} model=${model}`,
     );
 
-    const contents = (Array.isArray(messages) ? messages : []).map((message) => ({
-      role: message.role === 'assistant' ? 'model' : 'user',
-      parts: [{ text: message.content }],
-    }));
-    const payload: any = {
-      contents,
-      generationConfig: {
-        maxOutputTokens:
-          typeof maxTokens === 'number' && maxTokens > 0 ? maxTokens : 8192,
-      },
-    };
-    if (typeof systemPrompt === 'string' && systemPrompt) {
-      payload.systemInstruction = { parts: [{ text: systemPrompt }] };
-    }
-
-    const sse = createSseResponse(res);
-    let proxyDispatcher: ReturnType<typeof proxyDispatcherRequestInit> | null = null;
-    try {
-      proxyDispatcher = proxyDispatcherRequestInit();
-      sse.send('start', { model });
-      const response = await fetch(url, {
-        ...proxyDispatcher.requestInit,
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': apiKey,
-        },
-        body: JSON.stringify(payload),
-        redirect: 'error',
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        console.error(
-          `[proxy:google] upstream error: ${response.status} ${redactAuthTokens(errorText)}`,
-        );
-        sendProxyError(sse, `Upstream error: ${response.status}`, {
-          code: proxyErrorCode(response.status),
-          details: errorText,
-          retryable: response.status === 429 || response.status >= 500,
-        });
-        return sse.end();
-      }
-
-      let ended = false;
-      const guard = createDeltaGuard(sse);
-      await streamUpstreamSse(response, ({ data }: any) => {
-        if (!data) return false;
-        const streamError = extractStreamErrorMessage(data);
-        if (streamError) {
-          sendProxyError(sse, `Gemini error: ${streamError}`, { details: data });
-          ended = true;
-          return true;
-        }
-        const delta = extractGeminiText(data);
-        if (delta) { guard.sendDelta(delta); 
-          if (guard.contaminated) { 
-            sse.send('end', {}); 
-            ended = true; 
-            return true; 
-          } 
-        }
-        const blockMessage = extractGeminiBlockMessage(data);
-        if (blockMessage) {
-          sendProxyError(sse, blockMessage, { details: data });
-          ended = true;
-          return true;
-        }
-        return false;
-      });
-      if (!ended) sse.send('end', {});
-      sse.end();
-    } catch (err: any) {
-      console.error(`[proxy:google] internal error: ${err.message}`);
-      sendProxyError(sse, err.message, { code: 'INTERNAL_ERROR' });
-      sse.end();
-    } finally {
-      await proxyDispatcher?.close();
-    }
+    return runGeminiChatStream(res, {
+      url,
+      headers: { 'x-goog-api-key': apiKey },
+      payload: buildGeminiChatPayload(systemPrompt, messages, maxTokens),
+      model,
+      logTag: 'proxy:google',
+    });
   });
 
   app.post('/api/proxy/ollama/stream', async (req, res) => {
@@ -1290,6 +1337,15 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
     runSpeech: ByokToolRunner;
     /** Omitted when the provider has no video endpoint (AIHubMix). */
     runVideo?: ByokToolRunner;
+    /**
+     * AIHubMix only: route by model name to the native protocol wire
+     * (claude → Anthropic /v1/messages, gemini or imagen → Gemini
+     * streamGenerateContent), all on the AIHubMix origin + APP-Code. Those
+     * routes run base chat WITHOUT the tool loop (no in-chat generate_image
+     * yet — the OpenAI family keeps it). When unset/false the provider always
+     * uses the OpenAI tool-loop path (SenseAudio).
+     */
+    routeByModel?: boolean;
   }
 
   const registerByokToolChatProxy = (
@@ -1340,6 +1396,42 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
         validated.forbidden ? 'FORBIDDEN' : 'BAD_REQUEST',
         validated.error,
       );
+    }
+
+    // AIHubMix: route by model name to the native protocol wire. claude* and
+    // gemini*/imagen* run base chat (no tool loop yet) on their native
+    // endpoint, derived from the AIHubMix origin, with APP-Code attached. The
+    // OpenAI family (everything else) falls through to the tool-loop path
+    // below, which keeps in-chat generate_image.
+    if (opts.routeByModel) {
+      const family = classifyAIHubMixModel(model);
+      const origin = aihubmixOriginFromBase(effectiveBaseUrl);
+      if (family === 'anthropic') {
+        const anthropicUrl = appendVersionedApiPath(origin, '/messages');
+        console.log(`[${opts.logTag}] ${req.method} anthropic ${anthropicUrl} model=${model} project=${projectId}`);
+        return runAnthropicChatStream(res, {
+          url: anthropicUrl,
+          headers: {
+            'x-api-key': apiKey,
+            'anthropic-version': '2023-06-01',
+            ...aihubmixAppCodeHeader(),
+          },
+          payload: buildAnthropicChatPayload(model, systemPrompt, messages, maxTokens),
+          logTag: opts.logTag,
+        });
+      }
+      if (family === 'gemini') {
+        const geminiUrl = googleStreamGenerateContentUrl(`${origin}/gemini`, model);
+        console.log(`[${opts.logTag}] ${req.method} gemini ${geminiUrl} model=${model} project=${projectId}`);
+        return runGeminiChatStream(res, {
+          url: geminiUrl,
+          headers: { 'x-goog-api-key': apiKey, ...aihubmixAppCodeHeader() },
+          payload: buildGeminiChatPayload(systemPrompt, messages, maxTokens),
+          model,
+          logTag: opts.logTag,
+        });
+      }
+      // family === 'openai' → fall through to the OpenAI tool loop below.
     }
 
     const url = appendVersionedApiPath(effectiveBaseUrl, '/chat/completions');
@@ -1665,9 +1757,12 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
     runVideo: executeGenerateVideo,
   });
 
-  // AIHubMix: OpenAI-compatible image (/v1/images/generations) + TTS
-  // (/v1/audio/speech) executors, Bearer auth + fixed APP-Code header. No
-  // video endpoint, so `runVideo` is omitted.
+  // AIHubMix: routes by model name to the native protocol wire —
+  //   claude*        → Anthropic /v1/messages (base chat, no tools yet)
+  //   gemini*/imagen*→ Gemini :streamGenerateContent (base chat, no tools yet)
+  //   everything else→ OpenAI /v1/chat/completions WITH the tool loop below
+  // All on the AIHubMix origin + APP-Code. The OpenAI family keeps in-chat
+  // generate_image (/v1/images/generations) + TTS (/v1/audio/speech).
   registerByokToolChatProxy('/api/proxy/aihubmix/stream', {
     providerId: 'aihubmix',
     logTag: 'proxy:aihubmix',
@@ -1677,6 +1772,7 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
     isImageModel: isAIHubMixImageModel,
     runImage: executeAIHubMixGenerateImage,
     runSpeech: executeAIHubMixGenerateSpeech,
+    routeByModel: true,
   });
 
 }
