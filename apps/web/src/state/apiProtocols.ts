@@ -86,11 +86,13 @@ export const SUGGESTED_MODELS_BY_PROTOCOL: Record<ApiProtocol, readonly string[]
     // Anthropic / Gemini / DeepSeek by model name on its side. Listing the
     // headline cross-vendor checkpoints keeps the picker useful without
     // pretending to enumerate the full catalogue — users can type any id
-    // AIHubMix exposes.
-    'gpt-4o',
-    'gpt-4o-mini',
+    // AIHubMix exposes (or fetch the full live list). claude-opus-4-8 leads
+    // as the default chat model.
+    'claude-opus-4-8',
     'claude-sonnet-4-5',
     'claude-haiku-4-5',
+    'gpt-4o',
+    'gpt-4o-mini',
     'gemini-2.0-flash',
     'deepseek-chat',
     'deepseek-reasoner',
