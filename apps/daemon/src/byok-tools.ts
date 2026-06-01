@@ -56,7 +56,12 @@ export const BYOK_AIHUBMIX_DEFAULT_IMAGE_MODEL =
   BYOK_AIHUBMIX_IMAGE_MODELS[0] ?? 'aihubmix-gpt-image-1';
 
 export function isAIHubMixImageModel(value: unknown): value is string {
-  return typeof value === 'string' && BYOK_AIHUBMIX_IMAGE_MODELS.includes(value);
+  // AIHubMix image models are discovered live (50+), so the static registry
+  // only seeds a couple. Any `aihubmix-` prefixed id renders through the same
+  // OpenAI-compatible endpoint (the prefix is stripped to the wire name), so
+  // accept the whole namespace rather than just the seeded ids.
+  return typeof value === 'string'
+    && (value.startsWith('aihubmix-') || BYOK_AIHUBMIX_IMAGE_MODELS.includes(value));
 }
 
 const AIHUBMIX_DEFAULT_TTS_MODEL = 'tts-1';

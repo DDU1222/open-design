@@ -86,6 +86,10 @@ import {
   fetchLatestGithubReleaseInfo,
 } from '../providers/registry';
 import { IMAGE_MODELS, MEDIA_PROVIDERS } from '../media/models';
+import {
+  mergeAihubmixImageModels,
+  useAIHubMixImageModels,
+} from '../media/aihubmix-image-models';
 import { XaiOAuthControl } from './XaiOAuthControl';
 import type { MediaProvider } from '../media/models';
 import { Toast } from './Toast';
@@ -1914,6 +1918,17 @@ export function SettingsDialog({
     ),
     [fetchedApiModelOptions, suggestedApiModelIds],
   );
+  // Live AIHubMix image catalogue for the BYOK chat generate_image picker
+  // below (so it lists the full image-generation catalogue, not just the
+  // static seeds). SenseAudio keeps its static registry list.
+  const aihubmixImageModels = useAIHubMixImageModels();
+  const byokImageModelOptions = useMemo(() => {
+    if (apiProtocol === 'aihubmix') {
+      return mergeAihubmixImageModels(IMAGE_MODELS, aihubmixImageModels)
+        .filter((m) => m.provider === 'aihubmix');
+    }
+    return IMAGE_MODELS.filter((m) => m.provider === apiProtocol);
+  }, [apiProtocol, aihubmixImageModels]);
   const apiModelIds = useMemo(
     () => apiModelOptions.map((m) => m.id),
     [apiModelOptions],
@@ -3543,17 +3558,14 @@ export function SettingsDialog({
                         Listing it explicitly lets the picker show what the
                         unconfigured state actually means. */}
                     <option value="">
-                      {IMAGE_MODELS.find((m) => m.provider === apiProtocol)?.label
-                        ?? 'default'}
+                      {byokImageModelOptions[0]?.label ?? 'default'}
                       {' (default)'}
                     </option>
-                    {IMAGE_MODELS.filter((m) => m.provider === apiProtocol).map(
-                      (m) => (
-                        <option key={m.id} value={m.id}>
-                          {m.label}
-                        </option>
-                      ),
-                    )}
+                    {byokImageModelOptions.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.label}
+                      </option>
+                    ))}
                   </select>
                 </label>
               ) : null}
