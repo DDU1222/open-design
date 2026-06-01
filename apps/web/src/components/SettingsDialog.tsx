@@ -85,11 +85,8 @@ import {
   fetchDesignTemplates,
   fetchLatestGithubReleaseInfo,
 } from '../providers/registry';
-import { IMAGE_MODELS, MEDIA_PROVIDERS } from '../media/models';
-import {
-  mergeAihubmixImageModels,
-  useAIHubMixImageModels,
-} from '../media/aihubmix-image-models';
+import { MEDIA_PROVIDERS } from '../media/models';
+import { useByokImageModelOptions } from '../media/aihubmix-image-models';
 import { XaiOAuthControl } from './XaiOAuthControl';
 import type { MediaProvider } from '../media/models';
 import { Toast } from './Toast';
@@ -1918,17 +1915,9 @@ export function SettingsDialog({
     ),
     [fetchedApiModelOptions, suggestedApiModelIds],
   );
-  // Live AIHubMix image catalogue for the BYOK chat generate_image picker
-  // below (so it lists the full image-generation catalogue, not just the
-  // static seeds). SenseAudio keeps its static registry list.
-  const aihubmixImageModels = useAIHubMixImageModels();
-  const byokImageModelOptions = useMemo(() => {
-    if (apiProtocol === 'aihubmix') {
-      return mergeAihubmixImageModels(IMAGE_MODELS, aihubmixImageModels)
-        .filter((m) => m.provider === 'aihubmix');
-    }
-    return IMAGE_MODELS.filter((m) => m.provider === apiProtocol);
-  }, [apiProtocol, aihubmixImageModels]);
+  // Shared hook: live AIHubMix catalogue for aihubmix, static registry for
+  // other providers (same list the chat composer's image picker uses).
+  const byokImageModelOptions = useByokImageModelOptions(apiProtocol);
   const apiModelIds = useMemo(
     () => apiModelOptions.map((m) => m.id),
     [apiModelOptions],

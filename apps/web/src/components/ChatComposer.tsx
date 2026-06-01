@@ -21,7 +21,7 @@ import {
   trackFileUploadResult,
 } from '../analytics/events';
 import { deriveUploadCohort } from '../analytics/upload-tracking';
-import { IMAGE_MODELS } from "../media/models";
+import { useByokImageModelOptions } from "../media/aihubmix-image-models";
 import { projectRawUrl, uploadProjectFiles, openFolderDialog, fetchConnectors } from "../providers/registry";
 import { patchProject } from "../state/projects";
 import { fetchMcpServers } from "../state/mcp";
@@ -247,6 +247,9 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
   ) {
     const t = useT();
     const analytics = useAnalytics();
+    // Shared hook: live AIHubMix catalogue for aihubmix, static registry for
+    // other providers. Same list the Settings image picker uses.
+    const byokImageModelOptions = useByokImageModelOptions(byokApiProtocol);
     const [draft, setDraft] = useState(
       () => initialDraft ?? loadComposerDraft(draftStorageKey) ?? "",
     );
@@ -1762,16 +1765,13 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
                 }}
               >
                 <option value="">
-                  {(IMAGE_MODELS.find((m) => m.provider === byokApiProtocol)?.label
-                    ?? 'default') + ' (default)'}
+                  {(byokImageModelOptions[0]?.label ?? 'default') + ' (default)'}
                 </option>
-                {IMAGE_MODELS.filter((m) => m.provider === byokApiProtocol).map(
-                  (m) => (
-                    <option key={m.id} value={m.id}>
-                      {m.label}
-                    </option>
-                  ),
-                )}
+                {byokImageModelOptions.map((m) => (
+                  <option key={m.id} value={m.id}>
+                    {m.label}
+                  </option>
+                ))}
               </select>
             </div>
           ) : null}

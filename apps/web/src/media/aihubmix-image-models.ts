@@ -11,8 +11,8 @@
 // The result is cached at module scope (one fetch per page load) and exposed
 // via a hook so every image picker shows the same list without each surface
 // issuing its own request.
-import { useEffect, useState } from 'react';
-import type { MediaModel } from './models';
+import { useEffect, useMemo, useState } from 'react';
+import { IMAGE_MODELS, type MediaModel } from './models';
 
 type FetchedModel = { id: string; label: string };
 
@@ -99,4 +99,26 @@ export function useAIHubMixImageModels(): MediaModel[] {
     };
   }, []);
   return models;
+}
+
+/**
+ * Shared option list for the single-provider BYOK image-model pickers (the
+ * Settings "image generation model" field and the chat composer's inline
+ * picker). For AIHubMix it returns the live catalogue (with static seeds as
+ * fallback); for any other media provider (e.g. SenseAudio) it returns that
+ * provider's static registry entries. Keeps the three picker sites from each
+ * re-deriving the same merge+filter.
+ */
+export function useByokImageModelOptions(
+  provider: string | undefined,
+): MediaModel[] {
+  const dynamic = useAIHubMixImageModels();
+  return useMemo(() => {
+    if (provider === 'aihubmix') {
+      return mergeAihubmixImageModels(IMAGE_MODELS, dynamic).filter(
+        (m) => m.provider === 'aihubmix',
+      );
+    }
+    return IMAGE_MODELS.filter((m) => m.provider === provider);
+  }, [provider, dynamic]);
 }
