@@ -255,17 +255,21 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
         'protocol must be one of anthropic|openai|azure|google|ollama|senseaudio|aihubmix',
       );
     }
+    // AIHubMix's catalogue (GET /api/v1/models?type=llm) is public, so its
+    // model list loads without a key. Every other protocol needs the key to
+    // hit its /v1/models endpoint.
+    const apiKeyRequired = protocol !== 'aihubmix';
     if (
       typeof body.baseUrl !== 'string' ||
       typeof body.apiKey !== 'string' ||
       !body.baseUrl.trim() ||
-      !body.apiKey.trim()
+      (apiKeyRequired && !body.apiKey.trim())
     ) {
       return sendApiError(
         res,
         400,
         'BAD_REQUEST',
-        'baseUrl and apiKey are required',
+        apiKeyRequired ? 'baseUrl and apiKey are required' : 'baseUrl is required',
       );
     }
     try {

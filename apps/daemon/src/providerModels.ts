@@ -180,8 +180,10 @@ function providerModelsHeaders(
     return { authorization: `Bearer ${apiKey}` };
   }
   if (protocol === 'aihubmix') {
-    // Carry the fixed APP-Code attribution header on model discovery too.
-    return aihubmixHeaders(apiKey);
+    // The catalogue is public — only attach Bearer auth (+ APP-Code) when the
+    // user actually supplied a key. An empty `Bearer ` would be rejected by
+    // some gateways, so send no headers when the key is blank.
+    return apiKey.trim() ? aihubmixHeaders(apiKey) : {};
   }
   if (protocol === 'anthropic') {
     return {

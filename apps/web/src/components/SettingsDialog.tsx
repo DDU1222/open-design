@@ -342,9 +342,13 @@ function missingByokConnectionFields(
 
 function missingByokModelFetchFields(
   config: Pick<AppConfig, 'apiKey' | 'baseUrl'>,
+  protocol?: ApiProtocol,
 ): ByokRequiredField[] {
   const missing: ByokRequiredField[] = [];
-  if (!config.apiKey.trim()) missing.push('api_key');
+  // AIHubMix publishes its catalogue on a public endpoint, so its model list
+  // loads without a key (the user shouldn't need to paste a key just to browse
+  // models). Every other protocol fetches /v1/models behind the key.
+  if (protocol !== 'aihubmix' && !config.apiKey.trim()) missing.push('api_key');
   if (!config.baseUrl.trim()) missing.push('base_url');
   return missing;
 }
@@ -948,7 +952,7 @@ export function SettingsDialog({
         initial.mode !== 'api' ||
         protocol === 'azure' ||
         protocol === 'ollama' ||
-        missingByokModelFetchFields(initial).length > 0 ||
+        missingByokModelFetchFields(initial, protocol).length > 0 ||
         !isValidApiBaseUrl(initial.baseUrl)
       ) {
         return null;
@@ -1421,7 +1425,7 @@ export function SettingsDialog({
       }
       return;
     }
-    const missing = missingByokModelFetchFields(cfg);
+    const missing = missingByokModelFetchFields(cfg, apiProtocol);
     if (missing.length > 0) {
       if (!options.silent) {
         showByokPreconditionNotice('test', missing);
@@ -1845,7 +1849,7 @@ export function SettingsDialog({
   );
   const fetchedApiModelOptions = providerModelsCache[providerModelsKey] ?? [];
   const commitProviderModelsInputs = () => {
-    if (missingByokModelFetchFields(cfg).length > 0 || !baseUrlValid) {
+    if (missingByokModelFetchFields(cfg, apiProtocol).length > 0 || !baseUrlValid) {
       setProviderModelsCommittedKey(null);
       return;
     }
@@ -1854,9 +1858,13 @@ export function SettingsDialog({
   useEffect(() => {
     if (cfg.mode !== 'api') return;
     if (apiProtocol === 'azure' || apiProtocol === 'ollama') return;
-    if (missingByokModelFetchFields(cfg).length > 0) return;
+    if (missingByokModelFetchFields(cfg, apiProtocol).length > 0) return;
     if (!baseUrlValid) return;
-    if (providerModelsCommittedKey !== providerModelsKey) return;
+    // AIHubMix needs no key and prefills its base URL, so there's nothing to
+    // debounce-commit — fetch as soon as the tab is selected. Every other
+    // protocol waits until the key/baseUrl inputs are committed (on blur) so we
+    // don't fire on each keystroke.
+    if (apiProtocol !== 'aihubmix' && providerModelsCommittedKey !== providerModelsKey) return;
     const timer = window.setTimeout(() => {
       void handleFetchProviderModels({ silent: true });
     }, 300);
