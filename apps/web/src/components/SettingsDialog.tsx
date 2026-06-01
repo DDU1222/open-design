@@ -3513,6 +3513,7 @@ export function SettingsDialog({
                     chatBaseUrl={cfg.baseUrl}
                     chatApiVersion={cfg.apiVersion ?? ''}
                     chatModel={cfg.model}
+                    apiModelOptions={apiModelOptions}
                   />
                 </div>
               </details>
