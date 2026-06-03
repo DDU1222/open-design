@@ -242,10 +242,14 @@ export function registerMediaRoutes(app: Express, ctx: RegisterMediaRoutesDeps) 
       raw === 'llm' || raw === 'video' || raw === 'tts'
         ? raw
         : 'image_generation';
-    const baseUrl =
-      typeof req.query.baseUrl === 'string' && req.query.baseUrl.trim()
-        ? req.query.baseUrl.trim()
-        : AIHUBMIX_DEFAULT_BASE_URL;
+    // This is an unauthenticated, public GET. The AIHubMix catalogue lives at a
+    // single fixed origin, so we deliberately do NOT honour a caller-supplied
+    // `baseUrl` here — letting the caller pick the fetch target would open an
+    // SSRF hole (e.g. pointing the daemon at http://169.254.169.254/ cloud
+    // metadata). Hard-code the official origin instead; a custom BYOK base URL
+    // only ever needs to differ for authenticated chat/media calls, not for
+    // browsing the public model catalogue.
+    const baseUrl = AIHUBMIX_DEFAULT_BASE_URL;
     const cacheKey = `${baseUrl}|${type}`;
     const cached = aihubmixCatalogCache.get(cacheKey);
     if (cached && Date.now() - cached.at < AIHUBMIX_CATALOG_TTL_MS) {

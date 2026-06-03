@@ -203,6 +203,45 @@ describe('aihubmix media generation', () => {
     expect(JSON.parse(opts.body).model).toBe('qwen-image-2.0-pro');
   });
 
+  it('routes a Gemini-family catalogue image model to the gemini generateContent wire', async () => {
+    // gemini/imagen image models reject the OpenAI /images/generations shape, so
+    // the media renderer must branch to the Gemini-native endpoint and read the
+    // inline base64 image — mirroring the chat tool's classifyAIHubMixModel split.
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      jsonResp({
+        candidates: [
+          { content: { parts: [{ inlineData: { data: FAKE_PNG.toString('base64') } }] } },
+        ],
+      }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await generateMedia({
+      surface: 'image',
+      model: 'aihubmix-gemini-2.5-flash-image',
+      prompt: 'a koi pond, watercolor',
+      aspect: '16:9',
+      output: 'koi-gemini.png',
+      projectRoot,
+      projectsRoot,
+      projectId: 'project-1',
+    });
+
+    expect(result.providerId).toBe('aihubmix');
+    const [url, opts] = fetchMock.mock.calls[0]!;
+    expect(String(url)).toBe(
+      'https://aihubmix.com/gemini/v1beta/models/gemini-2.5-flash-image:generateContent',
+    );
+    // Gemini wire uses x-goog-api-key, NOT an OpenAI Authorization bearer.
+    expect(opts.headers['x-goog-api-key']).toBe('sk-aihubmix-test-1234');
+    const body = JSON.parse(opts.body);
+    expect(body.generationConfig.imageConfig.aspectRatio).toBe('16:9');
+    expect(body.generationConfig.responseModalities).toContain('IMAGE');
+
+    const bytes = await readFile(path.join(projectsRoot, 'project-1', 'koi-gemini.png'));
+    expect(bytes.length).toBeGreaterThan(0);
+  });
+
   it('renders speech via /v1/audio/speech with the stripped wire model', async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(
       new Response(FAKE_MP3, { status: 200, headers: { 'content-type': 'audio/mpeg' } }),

@@ -25,6 +25,8 @@ import {
   aihubmixAppCodeHeader,
   aihubmixWireModel,
   aihubmixOriginFromBase,
+  aihubmixGeminiImageUrl,
+  aihubmixGeminiImageBytes,
   classifyAIHubMixModel,
   AIHUBMIX_IMAGE_ASPECT_TO_SIZE,
 } from './aihubmix.js';
@@ -1041,41 +1043,16 @@ export async function executeAIHubMixGenerateImage(
   let bytes: Buffer;
   try {
     if (protocol === 'gemini') {
-      const geminiUrl =
-        `${aihubmixOriginFromBase(baseUrl)}/gemini/v1beta/models/`
-        + `${encodeURIComponent(wireModel)}:generateContent`;
       console.log(
-        `[proxy:aihubmix] generate_image submit POST ${geminiUrl} model=${wireModel}`
+        `[proxy:aihubmix] generate_image submit POST ${aihubmixGeminiImageUrl(baseUrl, wireModel)} model=${wireModel}`
         + `${wireModel === catalogModel ? '' : ` (catalog=${catalogModel})`} (gemini-native)`,
       );
-      const resp = await fetch(geminiUrl, withToolRequestInit(ctx, {
-        method: 'POST',
-        redirect: 'error',
-        headers: { 'content-type': 'application/json', 'x-goog-api-key': apiKey, ...aihubmixAppCodeHeader() },
-        body: JSON.stringify({
-          contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          generationConfig: {
-            responseModalities: ['TEXT', 'IMAGE'],
-            imageConfig: { aspectRatio: aspect },
-          },
-        }),
-      }));
-      if (!resp.ok) {
-        const text = await resp.text().catch(() => '');
-        return { ok: false, error: `aihubmix image (gemini) ${resp.status}: ${text.slice(0, 240)}` };
-      }
-      const data = (await resp.json()) as any;
-      const parts: any[] = data?.candidates?.[0]?.content?.parts ?? [];
-      const b64 = parts
-        .map((p) => p?.inlineData?.data || p?.inline_data?.data)
-        .find((d) => typeof d === 'string' && d);
-      if (!b64) {
-        return {
-          ok: false,
-          error: `aihubmix gemini image response had no inline image data: ${JSON.stringify(data).slice(0, 200)}`,
-        };
-      }
-      bytes = Buffer.from(b64, 'base64');
+      // Shared with the media renderer (renderAIHubMixImage) so the gemini wire
+      // shape + inline-image parse live in exactly one place.
+      bytes = await aihubmixGeminiImageBytes(
+        { baseUrl, apiKey, wireModel, prompt, aspect },
+        (url, init) => fetch(url, withToolRequestInit(ctx, init)),
+      );
     } else {
       console.log(
         `[proxy:aihubmix] generate_image submit POST ${appendOpenAIApiPath(baseUrl, '/images/generations')} model=${wireModel}`

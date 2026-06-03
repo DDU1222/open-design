@@ -89,6 +89,74 @@ export function aihubmixOriginFromBase(baseUrl: string): string {
   }
 }
 
+/** Gemini-native generateContent endpoint for an AIHubMix image model. */
+export function aihubmixGeminiImageUrl(baseUrl: string, wireModel: string): string {
+  return (
+    `${aihubmixOriginFromBase(baseUrl)}/gemini/v1beta/models/`
+    + `${encodeURIComponent(wireModel)}:generateContent`
+  );
+}
+
+export interface AIHubMixGeminiImageRequest {
+  baseUrl: string;
+  apiKey: string;
+  wireModel: string;
+  prompt: string;
+  /** Gemini aspectRatio string, e.g. "1:1" / "16:9". */
+  aspect: string;
+}
+
+/**
+ * Generate an image through AIHubMix's Gemini-native `generateContent` wire and
+ * return the decoded image bytes.
+ *
+ * gemini/imagen-family image models reject the OpenAI `/images/generations`
+ * shape ("Unknown name prompt/n/size"), so both the in-chat tool
+ * (`executeAIHubMixGenerateImage`) and the Home/New Project/CLI media renderer
+ * (`renderAIHubMixImage`) route those models here. This helper owns the single
+ * source of truth for the request body and the inline-image response parse;
+ * `doFetch` lets each caller apply its own request-init wrapper (proxy
+ * dispatcher, abort signal, redirect policy). Throws on a non-OK status or a
+ * response without inline image data.
+ */
+export async function aihubmixGeminiImageBytes(
+  req: AIHubMixGeminiImageRequest,
+  doFetch: (url: string, init: RequestInit) => Promise<Response>,
+): Promise<Buffer> {
+  const url = aihubmixGeminiImageUrl(req.baseUrl, req.wireModel);
+  const resp = await doFetch(url, {
+    method: 'POST',
+    redirect: 'error',
+    headers: {
+      'content-type': 'application/json',
+      'x-goog-api-key': req.apiKey,
+      ...aihubmixAppCodeHeader(),
+    },
+    body: JSON.stringify({
+      contents: [{ role: 'user', parts: [{ text: req.prompt }] }],
+      generationConfig: {
+        responseModalities: ['TEXT', 'IMAGE'],
+        imageConfig: { aspectRatio: req.aspect },
+      },
+    }),
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '');
+    throw new Error(`aihubmix image (gemini) ${resp.status}: ${text.slice(0, 240)}`);
+  }
+  const data = (await resp.json()) as any;
+  const parts: any[] = data?.candidates?.[0]?.content?.parts ?? [];
+  const b64 = parts
+    .map((p) => p?.inlineData?.data || p?.inline_data?.data)
+    .find((d) => typeof d === 'string' && d);
+  if (!b64) {
+    throw new Error(
+      `aihubmix gemini image response had no inline image data: ${JSON.stringify(data).slice(0, 200)}`,
+    );
+  }
+  return Buffer.from(b64, 'base64');
+}
+
 // Catalogue ids vs wire names. The media registry requires globally-unique
 // model ids, but `gpt-image-1` / `dall-e-3` / `tts-1` are already owned by the
 // `openai` provider. So AIHubMix's models are registered with an `aihubmix-`

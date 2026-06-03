@@ -76,6 +76,8 @@ import {
   aihubmixHeaders,
   aihubmixWireModel,
   aihubmixVideoSeconds,
+  aihubmixGeminiImageBytes,
+  classifyAIHubMixModel,
 } from './aihubmix.js';
 
 const execFile = promisify(execFileCb);
@@ -2916,6 +2918,16 @@ async function renderAIHubMixImage(ctx: MediaContext, credentials: ProviderConfi
   }
   const baseUrl = credentials.baseUrl || AIHUBMIX_DEFAULT_BASE_URL;
   const wireModel = aihubmixWireModel(credentials.model || ctx.wireModel);
+
+  // The live catalogue exposes Gemini/Imagen-family image models, which reject
+  // the OpenAI `/images/generations` shape ("Unknown name prompt/n/size") and
+  // must use the Gemini-native generateContent wire instead. Mirror the chat
+  // tool's per-model branch (executeAIHubMixGenerateImage) so the Home / New
+  // Project / CLI media path handles the same catalogue it now exposes.
+  if (classifyAIHubMixModel(wireModel) === 'gemini') {
+    return renderAIHubMixGeminiImage(ctx, credentials, baseUrl, wireModel);
+  }
+
   const url = buildOpenAIImageUrl(baseUrl, false);
 
   const body: Record<string, unknown> = {
@@ -2963,6 +2975,37 @@ async function renderAIHubMixImage(ctx: MediaContext, credentials: ProviderConfi
   return {
     bytes,
     providerNote: `aihubmix/${wireModel} · ${ctx.aspect} · ${bytes.length} bytes`,
+    suggestedExt: '.png',
+  };
+}
+
+// Gemini/Imagen-family image models on AIHubMix: the OpenAI image shape 400s
+// for these, so route them through the shared Gemini-native helper the chat
+// tool also uses (aihubmixGeminiImageBytes), passing the media request-init
+// wrapper so proxy/abort settings still apply.
+async function renderAIHubMixGeminiImage(
+  ctx: MediaContext,
+  credentials: ProviderConfig,
+  baseUrl: string,
+  wireModel: string,
+): Promise<RenderResult> {
+  if (!credentials.apiKey) {
+    throw new Error('no AIHubMix API key — configure it in Settings or set OD_AIHUBMIX_API_KEY');
+  }
+  const aspect = ctx.aspect || '1:1';
+  const bytes = await aihubmixGeminiImageBytes(
+    {
+      baseUrl,
+      apiKey: credentials.apiKey,
+      wireModel,
+      prompt: ctx.prompt || 'A high-quality reference image.',
+      aspect,
+    },
+    (url, init) => fetch(url, withMediaRequestInit(ctx, init)),
+  );
+  return {
+    bytes,
+    providerNote: `aihubmix/${wireModel} · ${aspect} · ${bytes.length} bytes (gemini-native)`,
     suggestedExt: '.png',
   };
 }
