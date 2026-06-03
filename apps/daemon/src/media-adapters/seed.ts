@@ -33,31 +33,34 @@ export const AIHUBMIX_VIDEO_SEED: ModelCapability[] = [
     supportedAspectRatios: ['16:9', '9:16', '1:1', '4:3', '3:4'],
   },
 
-  // ── Alibaba Wan / 万相 (generic flat shape via the gateway) ──────────────
+  // ── Alibaba Wan / 万相 (DashScope/wanx wire: input.media + parameters) ────
   {
     id: 'wan2.5-t2v-preview',
     apiModel: 'wan2.5-t2v-preview',
     mediaType: 'video',
-    family: 'generic',
+    family: 'wan',
     caps: ['t2v'],
     supportedDurations: [5, 10],
+    supportedResolutions: ['480P', '720P', '1080P'],
   },
   {
     id: 'wan2.5-i2v-preview',
     apiModel: 'wan2.5-i2v-preview',
     mediaType: 'video',
-    family: 'generic',
+    family: 'wan',
     caps: ['i2v'],
     supportedFrameImages: ['first_frame'],
     supportedDurations: [5, 10],
+    supportedResolutions: ['480P', '720P', '1080P'],
   },
   {
     id: 'wan2.6-i2v',
     apiModel: 'wan2.6-i2v',
     mediaType: 'video',
-    family: 'generic',
+    family: 'wan',
     caps: ['i2v'],
     supportedFrameImages: ['first_frame'],
+    supportedResolutions: ['480P', '720P', '1080P'],
   },
 
   // ── OpenAI Sora — flat shape with input_reference ────────────────────────
@@ -93,19 +96,19 @@ export const AIHUBMIX_VIDEO_SEED: ModelCapability[] = [
     supportedDurations: [4, 6, 8],
   },
 
-  // ── HappyHorse (Alibaba ATH) — PLACEHOLDER ───────────────────────────────
-  // NOTE: happyhorse is NOT in aihubmix-video's static models.ts (it's DB-driven)
-  // and is NOT wired into the gateway's video-synthesis (wan) adaptor today, so
-  // its image path fails upstream. Its real contract (family / image field /
-  // extra_body like `mode`) is UNVERIFIED. Seeded as generic so it routes
-  // through the standard path; update once the upstream contract is confirmed.
-  // TODO(happyhorse): confirm family + imageInput field + extra_body, then fix.
+  // ── HappyHorse (Alibaba, DashScope/wanx-backed) ──────────────────────────
+  // Verified against a working happyhorse-1.0-i2v call: it uses the DashScope
+  // wanx wire — { input:{ prompt, media:[{type:first_frame,url}] },
+  // parameters:{ resolution:"720P", duration, prompt_extend, watermark } } —
+  // NOT the flat input_reference shape. Routed through the `wan` family.
   {
     id: 'happyhorse-1.0-i2v',
     apiModel: 'happyhorse-1.0-i2v',
     mediaType: 'video',
-    family: 'generic',
+    family: 'wan',
     caps: ['i2v'],
     supportedFrameImages: ['first_frame'],
+    supportedDurations: [5],
+    supportedResolutions: ['480P', '720P', '1080P'],
   },
 ];

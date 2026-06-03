@@ -975,11 +975,13 @@ describe('executeAIHubMixGenerateVideo', () => {
         const body = JSON.parse(String(init?.body));
         // Default model is seedance → multimodal content[] shape (not flat).
         expect(body).toMatchObject({
-          model: 'doubao-seedance-2-0-260128', // prefix stripped to wire name
+          model: 'doubao-seedance-2-0-fast-260128', // prefix stripped to wire name
           prompt: 'a panda walking in a bamboo forest',
           duration: 8,
           ratio: '16:9',
-          resolution: '1280x720',
+          // Seedance wants a resolution TOKEN, not the aspect-derived 1280x720
+          // pixel string (which 400s with "resolution ... not valid ... in i2v").
+          resolution: '720p',
         });
         expect(body.content).toEqual([
           { type: 'text', text: 'a panda walking in a bamboo forest' },
@@ -1264,7 +1266,7 @@ describe('executeAIHubMixGenerateVideo', () => {
     expect(submitBody.seconds).toBe(expected);
   });
 
-  it('i2v (generic family): sends the reference image as a JSON input_reference data URL', async () => {
+  it('i2v (wan family): sends the reference image as first_frame in input.media', async () => {
     // Seed a project-local reference image.
     const refDir = path.join(projectsRoot, PROJECT_ID);
     await mkdir(refDir, { recursive: true });
@@ -1276,7 +1278,8 @@ describe('executeAIHubMixGenerateVideo', () => {
     const fetchMock = vi.fn(async (input: unknown, init?: RequestInit) => {
       const url = String(input);
       if (url === 'https://aihubmix.com/v1/videos') {
-        // generic i2v is JSON + input_reference data URL (not multipart).
+        // happyhorse/wan i2v is the DashScope wanx wire: JSON with the reference
+        // image as first_frame under input.media (NOT a flat input_reference).
         submitContentType =
           (init?.headers as Record<string, string> | undefined)?.['content-type'] ?? null;
         submitBody = JSON.parse(String(init?.body));
@@ -1306,10 +1309,15 @@ describe('executeAIHubMixGenerateVideo', () => {
     expect(result.ok).toBe(true);
     expect(submitContentType).toBe('application/json');
     expect(submitBody.model).toBe('happyhorse-1.0-i2v');
-    expect(submitBody.prompt).toBe('animate the panda');
-    expect(typeof submitBody.input_reference).toBe('string');
-    expect(submitBody.input_reference).toMatch(/^data:image\/png;base64,/);
-    expect(submitBody.input_reference).toContain(pngBytes.toString('base64'));
+    // wanx wire: prompt + first_frame live under input.{prompt,media}; the old
+    // flat top-level prompt / input_reference must NOT be present.
+    expect(submitBody.prompt).toBeUndefined();
+    expect(submitBody.input_reference).toBeUndefined();
+    expect(submitBody.input.prompt).toBe('animate the panda');
+    expect(submitBody.input.media[0].type).toBe('first_frame');
+    expect(submitBody.input.media[0].url).toMatch(/^data:image\/png;base64,/);
+    expect(submitBody.input.media[0].url).toContain(pngBytes.toString('base64'));
+    expect(submitBody.parameters.resolution).toBe('720P');
   });
 
   it('i2v: falls back to the newest project image when image_url is omitted', async () => {
@@ -1342,7 +1350,8 @@ describe('executeAIHubMixGenerateVideo', () => {
       baseCtx(),
     );
     expect(result.ok).toBe(true);
-    expect(submitBody.input_reference).toMatch(/^data:image\/png;base64,/);
+    expect(submitBody.input.media[0].type).toBe('first_frame');
+    expect(submitBody.input.media[0].url).toMatch(/^data:image\/png;base64,/);
   });
 
   it('i2v model: clear error (no upstream call) when no reference image exists', async () => {
@@ -1488,7 +1497,8 @@ describe('executeAIHubMixGenerateVideo', () => {
       baseCtx(),
     );
     expect(result.ok).toBe(false);
-    expect(result.error).toMatch(/did not accept the uploaded reference image/);
+    expect(result.error).toMatch(/did not accept the reference image/);
+    expect(result.error).toMatch(/publicly reachable image URL/);
     expect(result.error).toMatch(/doubao-seedance/);
     expect(result.error).toMatch(/happyhorse-1\.0-t2v may still work/);
   });

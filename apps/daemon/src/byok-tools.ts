@@ -85,7 +85,7 @@ export function isAIHubMixVideoModel(value: unknown): value is string {
 // Default AIHubMix video model (catalogue id; the `aihubmix-` prefix is stripped
 // to the wire name by aihubmixWireModel). Doubao Seedance is the most broadly
 // available text/image-to-video model on the gateway today.
-export const BYOK_AIHUBMIX_DEFAULT_VIDEO_MODEL = 'aihubmix-doubao-seedance-2-0-260128';
+export const BYOK_AIHUBMIX_DEFAULT_VIDEO_MODEL = 'aihubmix-doubao-seedance-2-0-fast-260128';
 
 // AIHubMix speech (TTS) models — discovered live via `?type=tts`; like image and
 // video we accept the whole `aihubmix-` namespace (prefix stripped to the wire
@@ -1302,8 +1302,10 @@ const IMAGE_EXT_MIME: Record<string, string> = {
   '.gif': 'image/gif',
 };
 
-// AIHubMix i2v takes the reference image as a multipart FILE upload (not a JSON
-// data URL), so we resolve to raw bytes + mime + filename, then attach as a Blob.
+// We resolve a project-local reference image to raw bytes + mime + filename,
+// then hand a base64 data URL to the media-adapters builder. Each video family
+// places it differently (seedance: content[].image_url; wan: input.media[];
+// generic: input_reference) — all as an inline data URL, no multipart upload.
 interface ReferenceImagePart {
   bytes: Buffer;
   mime: string;
@@ -1598,25 +1600,25 @@ export async function executeAIHubMixGenerateVideo(
         || data?.data?.error?.message || data?.message || '',
       );
       // "Params ignored" signature: we sent a real prompt but the upstream echo
-      // shows it empty (and the only error is the generic catch-all). That means
-      // AIHubMix accepted the request but didn't map our fields onto this model
-      // — i.e. the model isn't wired into the unified /videos schema (observed
-      // for the whole happyhorse-* family). Turn the opaque failure into an
-      // actionable message instead of relaying "Video generation failed".
+      // shows it empty (and the only error is the generic catch-all). AIHubMix
+      // accepted the request but didn't map our fields onto this model. Turn the
+      // opaque failure into an actionable message instead of relaying the bare
+      // "Video generation failed".
       const promptEchoedEmpty = typeof data?.prompt === 'string' && data.prompt === '' && prompt.length > 0;
       const genericOnly = !reason || /^video generation failed\.?$/i.test(reason.trim());
       if (promptEchoedEmpty && genericOnly) {
-        // Two distinct causes share this "params dropped" signature:
-        //  - With a reference image: the model didn't accept the multipart file
-        //    upload (e.g. happyhorse i2v/r2v want a public image_url URL, not a
-        //    multipart part — and our local project files aren't reachable by
-        //    AIHubMix anyway). Its text-to-video variant may still work.
-        //  - Without one: the model isn't wired into the unified schema at all.
+        // The wan/happyhorse families now use the correct DashScope wanx wire
+        // (input.media[{type:first_frame,url}] + parameters), so a remaining i2v
+        // failure is most likely the reference image: wanx-backed models may
+        // require a PUBLICLY reachable image URL, whereas we send a base64 data
+        // URL of a project-local file (which AIHubMix can't fetch by URL). Doubao
+        // Seedance accepts the inline data URL, so it's the reliable i2v path.
         const error = refImage
-          ? `${wireModel} did not accept the uploaded reference image — AIHubMix dropped the request `
-            + `parameters and it failed with no specific reason. This model likely isn't wired for `
-            + `image-to-video on AIHubMix's unified /videos endpoint. Use doubao-seedance-2-0-260128 `
-            + `for image-to-video; ${wireModel.replace(/-(i2v|r2v)$/, '-t2v')} may still work for text-to-video.`
+          ? `${wireModel} did not accept the reference image — AIHubMix dropped the request parameters `
+            + `and it failed with no specific reason. This model likely needs a publicly reachable image `
+            + `URL for image-to-video, but the project image is sent inline as a data URL. Use `
+            + `doubao-seedance-2-0-260128 for image-to-video (it accepts the inline image); `
+            + `${wireModel.replace(/-(i2v|r2v)$/, '-t2v')} may still work for text-to-video.`
           : `${wireModel} is not supported by AIHubMix's unified video API — it ignored the request `
             + `parameters (the prompt came back empty) and failed with no specific reason. Switch to a `
             + `supported model such as doubao-seedance-2-0-260128, sora-2, or a wan2.x model.`;

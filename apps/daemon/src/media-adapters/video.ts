@@ -3,7 +3,9 @@
 // Mirrors aihubmix-video's lib/server/video/create-task.ts family branching:
 //   • seedance (apiModel starts `doubao-seedance-`) → JSON with a multimodal
 //     `content[]` array (text + image_url{url,role:first_frame}); duration/ratio/resolution.
-//   • everything else (generic: wan / sora / happyhorse / …) → flat JSON
+//   • wan (wan* / happyhorse* — both DashScope/wanx-backed on the gateway) →
+//     { model, input:{ prompt, media:[{type:first_frame,url}] }, parameters:{ resolution, duration, prompt_extend, watermark } }.
+//   • generic (sora / veo / …) → flat JSON
 //     { model, prompt, seconds, aspect_ratio?, size?, input_reference? } with the
 //     reference image as a data URL.
 // The caller resolves the reference image to a data URL beforehand and attaches
@@ -24,7 +26,13 @@ export function resolveWireModel(cap: ModelCapability, hasReference: boolean): s
 /** Derive the request family from the resolved upstream model name (or explicit override). */
 export function deriveVideoFamily(wireModel: string, cap?: ModelCapability): MediaFamily {
   if (cap?.family) return cap.family;
-  return wireModel.startsWith('doubao-seedance-') ? 'seedance' : 'generic';
+  const m = wireModel.toLowerCase();
+  if (m.startsWith('doubao-seedance-')) return 'seedance';
+  // wan* and happyhorse* are both proxied to Alibaba DashScope/wanx, which uses
+  // the input.media + parameters wire shape (verified against a working
+  // happyhorse-1.0-i2v call). Route them through the `wan` family.
+  if (m.startsWith('wan') || m.startsWith('happyhorse')) return 'wan';
+  return 'generic';
 }
 
 /**
@@ -42,6 +50,32 @@ export function snapDuration(cap: ModelCapability, requested: number | undefined
     (best, v) => (Math.abs(v - req) < Math.abs(best - req) ? v : best),
     allowed[0]!,
   );
+}
+
+/**
+ * Seedance and wan accept resolution ONLY as a quality token (`480p`/`720p`/
+ * `1080p`), never a `WxH` pixel string. Callers may hand us either: an explicit
+ * token from the tool's `resolution` arg, or a pixel `size` like `1280x720`
+ * derived from an aspect ratio. Passing a pixel string straight through makes
+ * Doubao Seedance 400 with "the parameter resolution ... is not valid ... in
+ * i2v". Normalise to the nearest lowercase token by the short side (720→720p,
+ * 1080→1080p, …); default to 720p when nothing usable is supplied. (wan wants
+ * the uppercase form `720P`, so its branch upper-cases the result.)
+ */
+export function snapResolutionToken(
+  resolution: string | undefined,
+  size: string | undefined,
+): string {
+  const token = (resolution || '').trim().toLowerCase();
+  if (/^(480|720|1080)p$/.test(token)) return token;
+  const m = /^(\d+)\s*[x×]\s*(\d+)$/i.exec((size || resolution || '').trim());
+  if (m) {
+    const shortSide = Math.min(parseInt(m[1]!, 10), parseInt(m[2]!, 10));
+    if (shortSide <= 480) return '480p';
+    if (shortSide <= 720) return '720p';
+    return '1080p';
+  }
+  return '720p';
 }
 
 /** Apply extraBodyDefaults, then overlay caller passthrough filtered by the whitelist. */
@@ -101,11 +135,30 @@ export function buildVideoRequest(cap: ModelCapability, input: VideoBuildInput):
       duration: seconds,
       content: buildSeedanceContent(input),
     };
-    const resolution = input.resolution || input.size;
-    if (resolution) body.resolution = resolution;
+    // Seedance wants a resolution TOKEN (480p/720p/1080p), not a WxH pixel
+    // string. Normalise whichever the caller supplied, so an aspect-derived
+    // `size` like 1280x720 never reaches the wire as an invalid resolution.
+    body.resolution = snapResolutionToken(input.resolution, input.size);
     if (input.aspectRatio) body.ratio = input.aspectRatio;
     if (typeof input.generateAudio === 'boolean') body.generate_audio = input.generateAudio;
     if (typeof input.seed === 'number') body.seed = input.seed;
+  } else if (family === 'wan') {
+    // Alibaba DashScope/wanx wire (wan* + happyhorse*). The reference image is
+    // the FIRST FRAME inside input.media; everything tunable lives under
+    // `parameters`. Verified against a working happyhorse-1.0-i2v call.
+    const wanInput: Record<string, unknown> = { prompt: input.prompt };
+    if (hasReference) {
+      wanInput.media = [{ type: 'first_frame', url: input.imageRef!.dataUrl }];
+    }
+    const parameters: Record<string, unknown> = {
+      resolution: snapResolutionToken(input.resolution, input.size).toUpperCase(),
+      duration: seconds,
+      prompt_extend: true,
+      watermark: false,
+    };
+    if (input.aspectRatio) parameters.aspect_ratio = input.aspectRatio;
+    if (typeof input.seed === 'number') parameters.seed = input.seed;
+    body = { model: wireModel, input: wanInput, parameters };
   } else {
     body = {
       model: wireModel,

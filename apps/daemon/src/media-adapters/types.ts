@@ -14,10 +14,13 @@
 /**
  * Request-shape family. Determined from the *resolved* upstream model name
  * (i2v variant when a reference image is present), mirroring aihubmix-video's
- * create-task.ts branching. `generic` covers wan/sora/everything-else (flat
- * JSON with `input_reference`); only seedance uses the multimodal content array.
+ * create-task.ts branching.
+ *   • `seedance` — multimodal `content[]` array (ByteDance Ark).
+ *   • `wan` — Alibaba DashScope/wanx wire: `{ input:{ prompt, media[] }, parameters:{ resolution, duration, … } }`.
+ *     Covers wan* and happyhorse* (both proxied to DashScope by the gateway).
+ *   • `generic` — flat JSON `{ prompt, seconds, input_reference }` (sora/veo/…).
  */
-export type MediaFamily = 'seedance' | 'generic';
+export type MediaFamily = 'seedance' | 'wan' | 'generic';
 
 export type MediaType = 'video' | 'image' | 'audio';
 
