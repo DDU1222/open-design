@@ -79,6 +79,37 @@ describe('aihubmix shared helpers', () => {
       { id: 'qwen-image-2.0-pro', label: 'qwen-image-2.0-pro' }, // falls back to id
     ]);
   });
+
+  it('drops media-generation rows from the chat catalogue (chatOnly)', () => {
+    // AIHubMix's `?type=llm` matches any model whose `types` merely CONTAINS
+    // `llm`, so dual-tagged image models leak in. The chat picker must keep
+    // genuine chat models only — media models have their own pickers.
+    const parsed = parseAIHubMixCatalog(
+      {
+        data: [
+          { model_id: 'claude-opus-4-8', model_name: 'Claude Opus 4.8', types: 'llm' },
+          { model_id: 'qwen3.7-max', model_name: 'Qwen 3.7 Max', types: 'llm,search' },
+          { model_id: 'some-ocr-llm', model_name: 'OCR LLM', types: 'llm,ocr' },
+          // dual-tagged image models that pollute the chat picker today:
+          { model_id: 'gpt-image-2', model_name: 'GPT Image 2', types: 'image_generation,llm' },
+          { model_id: 'gemini-2.5-flash-image', model_name: 'Gemini Image', types: 'image_generation,llm' },
+          // pure media rows:
+          { model_id: 'qwen-image-2.0-pro', model_name: '', types: 'image_generation' },
+          { model_id: 'some-video', model_name: 'Video', types: 'video' },
+          { model_id: 'some-tts', model_name: 'TTS', types: 'tts' },
+          // missing types metadata is kept (don't hide a valid chat model):
+          { model_id: 'mystery-model', model_name: 'Mystery' },
+        ],
+      },
+      { chatOnly: true },
+    );
+    expect(parsed.map((m) => m.id)).toEqual([
+      'claude-opus-4-8',
+      'qwen3.7-max',
+      'some-ocr-llm',
+      'mystery-model',
+    ]);
+  });
 });
 
 describe('aihubmix media generation', () => {

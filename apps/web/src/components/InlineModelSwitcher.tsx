@@ -8,9 +8,18 @@
 // upward through the same callbacks `AvatarMenu` already uses, so the
 // switcher inherits autosave + daemon sync without re-implementing it.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type Dispatch,
+  type SetStateAction,
+} from 'react';
 import { useT } from '../i18n';
 import { KNOWN_PROVIDERS } from '../state/config';
+import { fetchProviderModels } from '../providers/provider-models';
 import {
   cancelVelaLogin,
   fetchVelaLoginStatus,
@@ -45,6 +54,12 @@ interface Props {
   onApiProtocolChange: (protocol: ApiProtocol) => void;
   onApiModelChange: (model: string) => void;
   providerModelsCache?: Record<string, ProviderModelOption[]>;
+  /** Lets the home picker warm the shared cache itself. Without it the picker
+   *  only READS the cache (warmed by Settings/onboarding), so on a fresh load
+   *  the BYOK list falls back to the small static seed list. */
+  onProviderModelsCacheChange?: Dispatch<
+    SetStateAction<Record<string, ProviderModelOption[]>>
+  >;
   onOpenSettings: (
     section?:
       | 'execution'
@@ -63,6 +78,7 @@ const API_PROTOCOL_TABS: Array<{ id: ApiProtocol; title: string }> = [
   { id: 'openai', title: 'OpenAI' },
   { id: 'azure', title: 'Azure' },
   { id: 'google', title: 'Google' },
+  { id: 'aihubmix', title: 'AIHubMix' },
 ];
 
 const AMR_REMINDER_SEEN_KEY = 'open-design:inline-amr-cli-reminder-seen:v2';
@@ -110,11 +126,13 @@ export function InlineModelSwitcher({
   onApiProtocolChange,
   onApiModelChange,
   providerModelsCache,
+  onProviderModelsCacheChange,
   onOpenSettings,
 }: Props) {
   const t = useT();
   const [open, setOpen] = useState(false);
   const wrapRef = useRef<HTMLDivElement | null>(null);
+  const providerModelsFetchingRef = useRef<Set<string>>(new Set());
   const [amrStatus, setAmrStatus] = useState<VelaLoginStatus | null>(null);
   const [amrLoginPending, setAmrLoginPending] = useState(false);
   const [amrLoginError, setAmrLoginError] = useState(false);
@@ -231,7 +249,20 @@ export function InlineModelSwitcher({
     if (!open) return;
     const onClick = (e: MouseEvent) => {
       if (!wrapRef.current) return;
-      if (!wrapRef.current.contains(e.target as Node)) setOpen(false);
+      const target = e.target as Node;
+      if (wrapRef.current.contains(target)) return;
+      // The model picker (`SearchableModelSelect`) renders its option list in a
+      // portal on `document.body`, so a click on an option lands OUTSIDE
+      // `wrapRef`. Without this guard the mousedown would close the whole
+      // switcher panel before the option's click fires, unmounting the picker
+      // and dropping the selection — the model would never change.
+      if (
+        target instanceof Element &&
+        target.closest('.model-select-searchable__popover')
+      ) {
+        return;
+      }
+      setOpen(false);
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') setOpen(false);
@@ -368,6 +399,59 @@ export function InlineModelSwitcher({
     [apiProtocol, config.apiProviderBaseUrl],
   );
   const fetchedProviderModels = providerModelsCache?.[providerModelsInputKey] ?? [];
+
+  // Warm the shared provider-models cache from the home picker itself. The
+  // picker otherwise depends on Settings/onboarding having fetched first, so on
+  // a fresh load the BYOK list shows only the small static seed list instead of
+  // the live catalogue. We fetch when the panel is open in BYOK mode and the
+  // preconditions for the active protocol are met (AIHubMix's catalogue is
+  // public, so it needs no key; every other protocol needs one). Results are
+  // keyed identically to Settings (`providerModelsInputKey`), so a single fetch
+  // serves both surfaces and replaces any stale slot.
+  useEffect(() => {
+    if (!open || config.mode !== 'api' || !onProviderModelsCacheChange) return;
+    if (apiProtocol === 'azure' || apiProtocol === 'ollama') return;
+    if (apiProtocol !== 'aihubmix' && !config.apiKey.trim()) return;
+    const baseUrl = config.baseUrl.trim();
+    if (!/^https?:\/\//i.test(baseUrl)) return;
+    const key = providerModelsInputKey;
+    if (fetchedProviderModels.length) return;
+    if (providerModelsFetchingRef.current.has(key)) return;
+    providerModelsFetchingRef.current.add(key);
+    let active = true;
+    void fetchProviderModels({
+      protocol: apiProtocol,
+      baseUrl,
+      apiKey: config.apiKey,
+    })
+      .then((result) => {
+        if (active && result.ok && result.models?.length) {
+          onProviderModelsCacheChange((current) => ({
+            ...current,
+            [key]: result.models ?? [],
+          }));
+        }
+      })
+      .catch(() => {
+        // Non-fatal: the picker falls back to the static seed list.
+      })
+      .finally(() => {
+        providerModelsFetchingRef.current.delete(key);
+      });
+    return () => {
+      active = false;
+    };
+  }, [
+    open,
+    config.mode,
+    config.apiKey,
+    config.baseUrl,
+    apiProtocol,
+    providerModelsInputKey,
+    fetchedProviderModels.length,
+    onProviderModelsCacheChange,
+  ]);
+
   const apiModelOptions = useMemo(() => {
     const discovered = fetchedProviderModels.map((model) => model.id);
     const staticOptions = providerForProtocol?.models ?? [];

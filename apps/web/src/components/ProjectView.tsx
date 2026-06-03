@@ -171,6 +171,11 @@ import { effectiveMaxTokens } from '../state/maxTokens';
 import { effectiveAgentModelChoice } from './agentModelSelection';
 import { mediaExecutionPolicyForProjectMetadata } from '../media/execution-policy';
 import {
+  useByokImageModelOptions,
+  useByokVideoModelOptions,
+  useByokSpeechModelOptions,
+} from '../media/aihubmix-image-models';
+import {
   buildFinalizeCredentialsMissingToast,
   buildFinalizeRequest,
 } from '../lib/resolve-finalize-request';
@@ -596,6 +601,27 @@ export function ProjectView({
   const [byokImageModelOverride, setByokImageModelOverride] = useState<string>(
     config.byokImageModel ?? '',
   );
+  // Same per-session override for the BYOK chat's generate_video tool, seeded
+  // from Settings (config.byokVideoModel). Persistent default lives in
+  // Settings → BYOK → AIHubMix → Video generation model.
+  const [byokVideoModelOverride, setByokVideoModelOverride] = useState<string>(
+    config.byokVideoModel ?? '',
+  );
+  // Same per-session overrides for the BYOK chat's generate_speech tool (model +
+  // voice), seeded from Settings.
+  const [byokSpeechModelOverride, setByokSpeechModelOverride] = useState<string>(
+    config.byokSpeechModel ?? '',
+  );
+  const [byokSpeechVoiceOverride, setByokSpeechVoiceOverride] = useState<string>(
+    config.byokSpeechVoice ?? '',
+  );
+  // Live model option lists (same hooks the composer/Settings pickers use) so
+  // the chat "default" (no explicit pick) resolves to the FIRST catalogue model
+  // shown in the dropdown — not a hardcoded id. The daemon keeps its own
+  // fallback for when the catalogue hasn't loaded.
+  const byokImageModelOptionsPV = useByokImageModelOptions(config.apiProtocol);
+  const byokVideoModelOptionsPV = useByokVideoModelOptions(config.apiProtocol);
+  const byokSpeechModelOptionsPV = useByokSpeechModelOptions(config.apiProtocol);
   // `closed` → no surface; `review` → read-only saved-state panel with a
   // preview + reopen-to-edit action (#1822); `edit` → the textarea editor.
   const [instructionsMode, setInstructionsMode] = useState<'closed' | 'review' | 'edit'>('closed');
@@ -2897,7 +2923,13 @@ export function ProjectView({
           // default model. Prefer the live composer override; fall back
           // to the Settings default when the composer dropdown is on
           // "use default". Other protocols ignore unknown body fields.
-          byokImageModel: byokImageModelOverride || config.byokImageModel,
+          byokImageModel:
+            byokImageModelOverride || config.byokImageModel || byokImageModelOptionsPV[0]?.id,
+          byokVideoModel:
+            byokVideoModelOverride || config.byokVideoModel || byokVideoModelOptionsPV[0]?.id,
+          byokSpeechModel:
+            byokSpeechModelOverride || config.byokSpeechModel || byokSpeechModelOptionsPV[0]?.id,
+          byokSpeechVoice: byokSpeechVoiceOverride || config.byokSpeechVoice,
         });
       }
     },
@@ -2910,6 +2942,17 @@ export function ProjectView({
       config,
       locale,
       agentsById,
+      // Per-session BYOK image/video model overrides are read inside this
+      // callback (see the streamMessage context below). Without them in the
+      // deps, the dropdown updates its state + display but handleSend keeps a
+      // stale closure and sends the previously selected model.
+      byokImageModelOverride,
+      byokVideoModelOverride,
+      byokSpeechModelOverride,
+      byokSpeechVoiceOverride,
+      byokImageModelOptionsPV,
+      byokVideoModelOptionsPV,
+      byokSpeechModelOptionsPV,
       composedSystemPrompt,
       onTouchProject,
       project.id,
@@ -4507,6 +4550,12 @@ export function ProjectView({
               byokApiProtocol={config.apiProtocol}
               byokImageModel={byokImageModelOverride}
               onChangeByokImageModel={setByokImageModelOverride}
+              byokVideoModel={byokVideoModelOverride}
+              onChangeByokVideoModel={setByokVideoModelOverride}
+              byokSpeechModel={byokSpeechModelOverride}
+              onChangeByokSpeechModel={setByokSpeechModelOverride}
+              byokSpeechVoice={byokSpeechVoiceOverride}
+              onChangeByokSpeechVoice={setByokSpeechVoiceOverride}
               projectMetadata={project.metadata}
               onProjectMetadataChange={(metadata) => {
                 onProjectChange({ ...project, metadata });

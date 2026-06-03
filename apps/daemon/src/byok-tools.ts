@@ -13,7 +13,7 @@
 // since the BYOK chat session already authenticates with the same API key.
 
 import path from 'node:path';
-import { writeFile } from 'node:fs/promises';
+import { writeFile, readFile, readdir, stat } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import { assertExternalAssetUrl } from './connectionTest.js';
 import { resolveProviderConfig } from './media-config.js';
@@ -22,9 +22,18 @@ import { ensureProject } from './projects.js';
 import {
   AIHUBMIX_DEFAULT_BASE_URL,
   aihubmixHeaders,
+  aihubmixAppCodeHeader,
   aihubmixWireModel,
+  aihubmixOriginFromBase,
+  classifyAIHubMixModel,
   AIHUBMIX_IMAGE_ASPECT_TO_SIZE,
 } from './aihubmix.js';
+import {
+  aihubmixMediaRegistry,
+  buildVideoRequest,
+  deriveVideoFamily,
+  type ModelCapability,
+} from './media-adapters/index.js';
 
 // SenseAudio image model allowlist — derived from the shared media-models
 // registry so adding a new SenseAudio image model in one place (media-models)
@@ -64,8 +73,51 @@ export function isAIHubMixImageModel(value: unknown): value is string {
     && (value.startsWith('aihubmix-') || BYOK_AIHUBMIX_IMAGE_MODELS.includes(value));
 }
 
+// AIHubMix video models are discovered live (the `?type=video` catalogue), so —
+// like image models — we accept the whole `aihubmix-` namespace rather than a
+// hand-maintained list. The prefix is stripped to the wire name before the
+// `/videos` call. When neither the composer picker nor the LLM supplies one,
+// the executor falls back to BYOK_AIHUBMIX_DEFAULT_VIDEO_MODEL.
+export function isAIHubMixVideoModel(value: unknown): value is string {
+  return typeof value === 'string' && value.startsWith('aihubmix-');
+}
+
+// Default AIHubMix video model (catalogue id; the `aihubmix-` prefix is stripped
+// to the wire name by aihubmixWireModel). Doubao Seedance is the most broadly
+// available text/image-to-video model on the gateway today.
+export const BYOK_AIHUBMIX_DEFAULT_VIDEO_MODEL = 'aihubmix-doubao-seedance-2-0-260128';
+
+// AIHubMix speech (TTS) models — discovered live via `?type=tts`; like image and
+// video we accept the whole `aihubmix-` namespace (prefix stripped to the wire
+// name). Falls back to BYOK_AIHUBMIX_DEFAULT_SPEECH_MODEL when unset.
+export function isAIHubMixSpeechModel(value: unknown): value is string {
+  return typeof value === 'string' && value.startsWith('aihubmix-');
+}
+export const BYOK_AIHUBMIX_DEFAULT_SPEECH_MODEL = 'aihubmix-tts-1';
+
 const AIHUBMIX_DEFAULT_TTS_MODEL = 'tts-1';
 const AIHUBMIX_DEFAULT_TTS_VOICE = 'alloy';
+
+// AIHubMix video knobs for the chat `generate_video` tool. The wire shape
+// mirrors renderAIHubMixVideo (media.ts): POST /videos → poll /videos/{id} →
+// download. Aspect → pixel size duplicated from media.ts's aihubmixVideoSizeFor
+// so the chat-tool path and CLI/media path stay in sync.
+const AIHUBMIX_VIDEO_ASPECT_RATIOS = ['16:9', '9:16', '1:1', '4:3', '3:4'] as const;
+const AIHUBMIX_VIDEO_DURATION_MIN = 4;
+const AIHUBMIX_VIDEO_DURATION_MAX = 15;
+const AIHUBMIX_VIDEO_DURATION_DEFAULT = 5;
+const AIHUBMIX_VIDEO_ASPECT_TO_SIZE: Record<string, string> = {
+  '16:9': '1280x720',
+  '9:16': '720x1280',
+  '1:1': '1024x1024',
+  '4:3': '960x720',
+  '3:4': '720x960',
+};
+// Poll cadence: Sora-class generations routinely take minutes. 5 s interval,
+// 144 attempts = 12 min ceiling, matching renderAIHubMixVideo's default.
+const AIHUBMIX_VIDEO_POLL_INTERVAL_MS_DEFAULT = 5000;
+const AIHUBMIX_VIDEO_MAX_POLLS = 144;
+const AIHUBMIX_VIDEO_PROGRESS_LOG_EVERY = 6;
 
 const SENSEAUDIO_DEFAULT_BASE_URL = 'https://api.senseaudio.cn';
 const PROMPT_MAX_LENGTH = 2000;
@@ -231,11 +283,10 @@ export const BYOK_SENSEAUDIO_TOOLS = [
 
 /**
  * OpenAI-compatible tool definitions injected into /api/proxy/aihubmix/stream.
- * AIHubMix routes image generation to `/v1/images/generations` (OpenAI shape)
- * and speech to `/v1/audio/speech`, so the chat session gets image + voiceover
- * parity. Video is intentionally omitted — AIHubMix does not document a video
- * endpoint, and silently injecting a non-working tool would just produce
- * failed tool calls.
+ * AIHubMix routes image generation to `/v1/images/generations` (OpenAI shape),
+ * speech to `/v1/audio/speech`, and video to the async `/v1/videos` endpoint
+ * (Sora-style submit → poll → download), so the chat session gets full
+ * image + voiceover + video parity with the Media panel.
  */
 export const BYOK_AIHUBMIX_TOOLS = [
   {
@@ -288,8 +339,55 @@ export const BYOK_AIHUBMIX_TOOLS = [
             description:
               `Optional OpenAI-style voice id (alloy, echo, fable, onyx, nova, shimmer). Defaults to ${AIHUBMIX_DEFAULT_TTS_VOICE}.`,
           },
+          model: {
+            type: 'string',
+            description:
+              'Optional TTS model override (an `aihubmix-` prefixed speech model id). Omit to use the user-configured default from Settings / the composer voice-model picker.',
+          },
         },
         required: ['text'],
+      },
+    },
+  },
+  {
+    type: 'function' as const,
+    function: {
+      name: 'generate_video',
+      description:
+        'Generate a short video (4–15 seconds) from a text prompt using AIHubMix video models (e.g. the ByteDance Seedance gateway). This is an asynchronous call that can take 30 s to a few minutes — the daemon polls the job for you, so the user just sees the chat waiting. After this tool succeeds, embed the returned URL in your reply as a markdown link, e.g. `[▶ Play video](url)`, because the chat\'s markdown renderer does not currently render `<video>` tags inline. Use this whenever the user asks for a video, clip, animation, or motion graphic.',
+      parameters: {
+        type: 'object',
+        properties: {
+          prompt: {
+            type: 'string',
+            description:
+              'Detailed motion description of the video. Include subject, action / camera move / scene transitions, style, lighting. Chinese or English. Maximum 2000 characters.',
+          },
+          aspect_ratio: {
+            type: 'string',
+            enum: [...AIHUBMIX_VIDEO_ASPECT_RATIOS],
+            description:
+              'Output aspect ratio. 16:9 for cinematic, 9:16 for vertical (phone / TikTok), 1:1 for social square, 4:3 / 3:4 for editorial. Defaults to 16:9.',
+          },
+          duration: {
+            type: 'integer',
+            minimum: AIHUBMIX_VIDEO_DURATION_MIN,
+            maximum: AIHUBMIX_VIDEO_DURATION_MAX,
+            description:
+              `Video length in seconds (integer). Allowed range ${AIHUBMIX_VIDEO_DURATION_MIN}–${AIHUBMIX_VIDEO_DURATION_MAX}; defaults to ${AIHUBMIX_VIDEO_DURATION_DEFAULT}. Shorter durations finish faster.`,
+          },
+          model: {
+            type: 'string',
+            description:
+              'Optional model override (an `aihubmix-` prefixed video model id). Omit this to use the user-configured default from Settings / the composer video picker.',
+          },
+          image_url: {
+            type: 'string',
+            description:
+              'Reference image for image-to-video (i2v) models — the first frame / character the video animates. Pass the daemon file URL of an image already in this project (e.g. an uploaded reference or a previously generated image, like /api/projects/<id>/files/<name>.png). REQUIRED when the selected model is an i2v model (its id contains "i2v"); for those models, if you omit it the daemon falls back to the most recent image in the project.',
+          },
+        },
+        required: ['prompt'],
       },
     },
   },
@@ -329,6 +427,17 @@ export interface BYOKToolContext {
    *  Falls back to `BYOK_SENSEAUDIO_DEFAULT_IMAGE_MODEL` (the registry's
    *  first SenseAudio image entry) when missing. */
   defaultImageModel?: string;
+  /** Default video model the user picked in BYOK Settings / the composer
+   *  video picker, used when the LLM didn't pass `model` in tool args.
+   *  Validated upstream against `isAIHubMixVideoModel`; falls back to
+   *  `BYOK_AIHUBMIX_DEFAULT_VIDEO_MODEL` when missing. */
+  defaultVideoModel?: string;
+  /** Default speech (TTS) model the user picked in the composer; authoritative
+   *  over the LLM's `model` arg. Falls back to BYOK_AIHUBMIX_DEFAULT_SPEECH_MODEL. */
+  defaultSpeechModel?: string;
+  /** Default speech voice the user picked in the composer; used when neither the
+   *  LLM nor the caller supplies a `voice_id`. */
+  defaultSpeechVoice?: string;
   /** Test-only override for the video polling interval (ms). Production
    *  uses 5 s (SenseAudio's recommendation) — tests pass small values
    *  (e.g. 1 ms) to keep the suite fast without changing the polling
@@ -526,6 +635,15 @@ export async function executeGenerateImage(
   }
 
   const trimmedBase = baseUrl.replace(/\/+$/, '');
+
+  // Log the resolved image model + size before the upstream call so
+  // `tools-dev logs` shows which SenseAudio image model a chat-driven
+  // generation actually hit. Mirrors the AIHubMix/video submit logs; it's a
+  // server-side call, so it never appears in the browser Network tab.
+  console.log(
+    `[proxy:senseaudio] generate_image submit POST ${trimmedBase}/v1/image/sync model=${senseAudioImageModel} size=${size}`,
+  );
+
   let imageUrl: string;
   try {
     const resp = await fetch(`${trimmedBase}/v1/image/sync`, withToolRequestInit(ctx, {
@@ -881,13 +999,17 @@ export async function executeAIHubMixGenerateImage(
       : '1:1';
   const size = AIHUBMIX_IMAGE_ASPECT_TO_SIZE[aspect];
 
-  // Model resolution: LLM arg > Settings default > registry default. The
-  // allowlist guards every step, then the catalogue id is mapped to the real
-  // upstream wire name before it reaches AIHubMix.
-  const catalogModel = isAIHubMixImageModel(args.model)
-    ? args.model
-    : isAIHubMixImageModel(ctx.defaultImageModel)
-      ? ctx.defaultImageModel
+  // Model resolution: the user's EXPLICIT composer/Settings pick wins over the
+  // LLM's `model` arg. The LLM tends to fill the tool's `model` enum (e.g.
+  // gpt-image-1) and would otherwise silently override the model the user
+  // selected in the composer dropdown. Only when the user made no selection
+  // (defaultImageModel unset) do we honour the LLM's choice, then the registry
+  // default. The allowlist guards every step; the catalogue id is then mapped
+  // to the upstream wire name.
+  const catalogModel = isAIHubMixImageModel(ctx.defaultImageModel)
+    ? ctx.defaultImageModel
+    : isAIHubMixImageModel(args.model)
+      ? args.model
       : BYOK_AIHUBMIX_DEFAULT_IMAGE_MODEL;
   const wireModel = aihubmixWireModel(catalogModel);
 
@@ -904,31 +1026,85 @@ export async function executeAIHubMixGenerateImage(
   const { apiKey, baseUrl } = await resolveAIHubMixCredentials(ctx);
   if (!apiKey) return { ok: false, error: 'no AIHubMix API key available' };
 
+  // Log the resolved image model + size before the upstream call so
+  // `tools-dev logs` shows which AIHubMix image model a chat-driven generation
+  // actually hit. Mirrors the generate_video submit log; it's a server-side
+  // call, so it never appears in the browser Network tab. When the wire model
+  // differs from the catalogue id it resolved from, surface both.
+  // Request-family branching (mirrors aihubmix-video's per-model requestMode):
+  //   gemini family (nano-banana / gemini-*-image / imagen) → Gemini-native
+  //     generateContent (the OpenAI /images/generations shape 400s with
+  //     "Unknown name prompt/n/size" for these models).
+  //   everything else (gpt-image / dall-e / qwen / wan / glm / doubao …) →
+  //     OpenAI /v1/images/generations (AIHubMix normalizes these on the gateway).
+  const protocol = classifyAIHubMixModel(wireModel);
   let bytes: Buffer;
   try {
-    const resp = await fetch(appendOpenAIApiPath(baseUrl, '/images/generations'), withToolRequestInit(ctx, {
-      method: 'POST',
-      redirect: 'error',
-      headers: { 'content-type': 'application/json', ...aihubmixHeaders(apiKey) },
-      body: JSON.stringify({ model: wireModel, prompt, n: 1, size }),
-    }));
-    if (!resp.ok) {
-      const text = await resp.text().catch(() => '');
-      return { ok: false, error: `aihubmix image ${resp.status}: ${text.slice(0, 240)}` };
-    }
-    const data = (await resp.json()) as { data?: Array<{ b64_json?: string; url?: string }> };
-    const entry = Array.isArray(data?.data) ? data.data[0] : null;
-    if (!entry) return { ok: false, error: 'aihubmix image response had no data[0]' };
-    if (entry.b64_json) {
-      bytes = Buffer.from(entry.b64_json, 'base64');
-    } else if (entry.url) {
-      const urlCheck = await assertExternalAssetUrl(entry.url);
-      if (!urlCheck.ok) return { ok: false, error: urlCheck.error };
-      const imgResp = await fetch(entry.url, withToolRequestInit(ctx, { redirect: 'error' }));
-      if (!imgResp.ok) return { ok: false, error: `image download ${imgResp.status}` };
-      bytes = Buffer.from(await imgResp.arrayBuffer());
+    if (protocol === 'gemini') {
+      const geminiUrl =
+        `${aihubmixOriginFromBase(baseUrl)}/gemini/v1beta/models/`
+        + `${encodeURIComponent(wireModel)}:generateContent`;
+      console.log(
+        `[proxy:aihubmix] generate_image submit POST ${geminiUrl} model=${wireModel}`
+        + `${wireModel === catalogModel ? '' : ` (catalog=${catalogModel})`} (gemini-native)`,
+      );
+      const resp = await fetch(geminiUrl, withToolRequestInit(ctx, {
+        method: 'POST',
+        redirect: 'error',
+        headers: { 'content-type': 'application/json', 'x-goog-api-key': apiKey, ...aihubmixAppCodeHeader() },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          generationConfig: {
+            responseModalities: ['TEXT', 'IMAGE'],
+            imageConfig: { aspectRatio: aspect },
+          },
+        }),
+      }));
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => '');
+        return { ok: false, error: `aihubmix image (gemini) ${resp.status}: ${text.slice(0, 240)}` };
+      }
+      const data = (await resp.json()) as any;
+      const parts: any[] = data?.candidates?.[0]?.content?.parts ?? [];
+      const b64 = parts
+        .map((p) => p?.inlineData?.data || p?.inline_data?.data)
+        .find((d) => typeof d === 'string' && d);
+      if (!b64) {
+        return {
+          ok: false,
+          error: `aihubmix gemini image response had no inline image data: ${JSON.stringify(data).slice(0, 200)}`,
+        };
+      }
+      bytes = Buffer.from(b64, 'base64');
     } else {
-      return { ok: false, error: 'aihubmix image response had neither b64_json nor url' };
+      console.log(
+        `[proxy:aihubmix] generate_image submit POST ${appendOpenAIApiPath(baseUrl, '/images/generations')} model=${wireModel}`
+        + `${wireModel === catalogModel ? '' : ` (catalog=${catalogModel})`} size=${size}`,
+      );
+      const resp = await fetch(appendOpenAIApiPath(baseUrl, '/images/generations'), withToolRequestInit(ctx, {
+        method: 'POST',
+        redirect: 'error',
+        headers: { 'content-type': 'application/json', ...aihubmixHeaders(apiKey) },
+        body: JSON.stringify({ model: wireModel, prompt, n: 1, size }),
+      }));
+      if (!resp.ok) {
+        const text = await resp.text().catch(() => '');
+        return { ok: false, error: `aihubmix image ${resp.status}: ${text.slice(0, 240)}` };
+      }
+      const data = (await resp.json()) as { data?: Array<{ b64_json?: string; url?: string }> };
+      const entry = Array.isArray(data?.data) ? data.data[0] : null;
+      if (!entry) return { ok: false, error: 'aihubmix image response had no data[0]' };
+      if (entry.b64_json) {
+        bytes = Buffer.from(entry.b64_json, 'base64');
+      } else if (entry.url) {
+        const urlCheck = await assertExternalAssetUrl(entry.url);
+        if (!urlCheck.ok) return { ok: false, error: urlCheck.error };
+        const imgResp = await fetch(entry.url, withToolRequestInit(ctx, { redirect: 'error' }));
+        if (!imgResp.ok) return { ok: false, error: `image download ${imgResp.status}` };
+        bytes = Buffer.from(await imgResp.arrayBuffer());
+      } else {
+        return { ok: false, error: 'aihubmix image response had neither b64_json nor url' };
+      }
     }
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -944,8 +1120,50 @@ export async function executeAIHubMixGenerateImage(
   };
 }
 
+// Gemini 2.5 TTS uses its own prebuilt voice names (NOT OpenAI's
+// alloy/echo/…). When the selected voice isn't a Gemini voice we fall back to
+// a sensible default so the request still succeeds.
+const GEMINI_TTS_VOICES = new Set([
+  'Zephyr', 'Puck', 'Charon', 'Kore', 'Fenrir', 'Leda', 'Orus', 'Aoede',
+  'Callirrhoe', 'Autonoe', 'Enceladus', 'Iapetus', 'Umbriel', 'Algieba',
+  'Despina', 'Erinome', 'Algenib', 'Rasalgethi', 'Laomedeia', 'Achernar',
+  'Alnilam', 'Schedar', 'Gacrux', 'Pulcherrima', 'Achird', 'Zubenelgenubi',
+  'Vindemiatrix', 'Sadachbia', 'Sadaltager', 'Sulafat',
+]);
+const GEMINI_TTS_DEFAULT_VOICE = 'Kore';
+
+/** Sample rate from a Gemini audio mime type like "audio/L16;rate=24000". */
+function parsePcmRate(mimeType: string | undefined): number {
+  const m = (mimeType || '').match(/rate=(\d+)/);
+  return m ? parseInt(m[1]!, 10) : 24000;
+}
+
+/** Wrap raw 16-bit mono PCM (Gemini TTS output) in a minimal WAV container so
+ *  the saved file is playable. */
+function pcmToWav(pcm: Buffer, sampleRate: number): Buffer {
+  const channels = 1;
+  const bitsPerSample = 16;
+  const byteRate = sampleRate * channels * (bitsPerSample / 8);
+  const blockAlign = channels * (bitsPerSample / 8);
+  const h = Buffer.alloc(44);
+  h.write('RIFF', 0);
+  h.writeUInt32LE(36 + pcm.length, 4);
+  h.write('WAVE', 8);
+  h.write('fmt ', 12);
+  h.writeUInt32LE(16, 16);
+  h.writeUInt16LE(1, 20); // PCM
+  h.writeUInt16LE(channels, 22);
+  h.writeUInt32LE(sampleRate, 24);
+  h.writeUInt32LE(byteRate, 28);
+  h.writeUInt16LE(blockAlign, 32);
+  h.writeUInt16LE(bitsPerSample, 34);
+  h.write('data', 36);
+  h.writeUInt32LE(pcm.length, 40);
+  return Buffer.concat([h, pcm]);
+}
+
 export async function executeAIHubMixGenerateSpeech(
-  args: { text?: unknown; voice_id?: unknown },
+  args: { text?: unknown; voice_id?: unknown; model?: unknown },
   ctx: BYOKToolContext,
 ): Promise<ImageToolResult> {
   const text = typeof args.text === 'string' ? args.text.trim() : '';
@@ -964,36 +1182,511 @@ export async function executeAIHubMixGenerateSpeech(
   const { apiKey, baseUrl } = await resolveAIHubMixCredentials(ctx);
   if (!apiKey) return { ok: false, error: 'no AIHubMix API key available' };
 
-  const voice =
-    typeof args.voice_id === 'string' && args.voice_id.trim()
-      ? args.voice_id.trim()
-      : AIHUBMIX_DEFAULT_TTS_VOICE;
+  // Model: the composer/Settings pick wins over the LLM's arg (same authoritative
+  // rule as image/video), then the registry default.
+  const catalogModel = isAIHubMixSpeechModel(ctx.defaultSpeechModel)
+    ? ctx.defaultSpeechModel
+    : isAIHubMixSpeechModel(args.model)
+      ? args.model
+      : BYOK_AIHUBMIX_DEFAULT_SPEECH_MODEL;
+  const wireModel = aihubmixWireModel(catalogModel);
 
+  // Voice: an explicit per-call voice (LLM/caller) wins, else the composer
+  // default, else the hard default. (Voice is per-utterance, so unlike model the
+  // explicit arg is honoured first.)
+  const voice =
+    (typeof args.voice_id === 'string' && args.voice_id.trim())
+      ? args.voice_id.trim()
+      : (typeof ctx.defaultSpeechVoice === 'string' && ctx.defaultSpeechVoice.trim())
+        ? ctx.defaultSpeechVoice.trim()
+        : AIHUBMIX_DEFAULT_TTS_VOICE;
+
+  // Request-family branching (mirrors the image executor): gemini TTS models
+  // use the Gemini-native generateContent endpoint (responseModalities:['AUDIO']
+  // + speechConfig) and return raw L16 PCM, which we wrap as WAV. Everything
+  // else uses the OpenAI /v1/audio/speech shape and returns MP3.
+  const protocol = classifyAIHubMixModel(wireModel);
   let bytes: Buffer;
+  let ext = 'mp3';
   try {
-    const resp = await fetch(appendOpenAIApiPath(baseUrl, '/audio/speech'), withToolRequestInit(ctx, {
-      method: 'POST',
-      redirect: 'error',
-      headers: { 'content-type': 'application/json', ...aihubmixHeaders(apiKey) },
-      body: JSON.stringify({
-        model: AIHUBMIX_DEFAULT_TTS_MODEL,
-        input: text,
-        voice,
-        response_format: 'mp3',
-      }),
-    }));
-    if (!resp.ok) {
-      const errText = await resp.text().catch(() => '');
-      return { ok: false, error: `aihubmix speech ${resp.status}: ${errText.slice(0, 240)}` };
+    if (protocol === 'gemini') {
+      const geminiUrl =
+        `${aihubmixOriginFromBase(baseUrl)}/gemini/v1beta/models/`
+        + `${encodeURIComponent(wireModel)}:generateContent`;
+      const geminiVoice = GEMINI_TTS_VOICES.has(voice) ? voice : GEMINI_TTS_DEFAULT_VOICE;
+      console.log(
+        `[proxy:aihubmix] generate_speech submit POST ${geminiUrl} model=${wireModel} voice=${geminiVoice} (gemini-native)`,
+      );
+      const resp = await fetch(geminiUrl, withToolRequestInit(ctx, {
+        method: 'POST',
+        redirect: 'error',
+        headers: { 'content-type': 'application/json', 'x-goog-api-key': apiKey, ...aihubmixAppCodeHeader() },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text }] }],
+          generationConfig: {
+            responseModalities: ['AUDIO'],
+            speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: geminiVoice } } },
+          },
+        }),
+      }));
+      if (!resp.ok) {
+        const t = await resp.text().catch(() => '');
+        return { ok: false, error: `aihubmix speech (gemini) ${resp.status}: ${t.slice(0, 240)}` };
+      }
+      const data = (await resp.json()) as any;
+      const parts: any[] = data?.candidates?.[0]?.content?.parts ?? [];
+      const part = parts.find((p) => p?.inlineData?.data || p?.inline_data?.data);
+      const b64 = part?.inlineData?.data || part?.inline_data?.data;
+      if (!b64) {
+        return {
+          ok: false,
+          error: `aihubmix gemini speech response had no inline audio: ${JSON.stringify(data).slice(0, 200)}`,
+        };
+      }
+      const mime: string = part?.inlineData?.mimeType || part?.inline_data?.mime_type || '';
+      const raw = Buffer.from(b64, 'base64');
+      // Gemini returns L16 PCM; wrap as WAV unless it already gave a container.
+      if (/wav|mp3|mpeg|ogg/i.test(mime)) {
+        bytes = raw;
+        ext = /mp3|mpeg/i.test(mime) ? 'mp3' : /ogg/i.test(mime) ? 'ogg' : 'wav';
+      } else {
+        bytes = pcmToWav(raw, parsePcmRate(mime));
+        ext = 'wav';
+      }
+    } else {
+      console.log(
+        `[proxy:aihubmix] generate_speech submit POST ${appendOpenAIApiPath(baseUrl, '/audio/speech')} model=${wireModel}`
+        + `${wireModel === catalogModel ? '' : ` (catalog=${catalogModel})`} voice=${voice}`,
+      );
+      const resp = await fetch(appendOpenAIApiPath(baseUrl, '/audio/speech'), withToolRequestInit(ctx, {
+        method: 'POST',
+        redirect: 'error',
+        headers: { 'content-type': 'application/json', ...aihubmixHeaders(apiKey) },
+        body: JSON.stringify({
+          model: wireModel,
+          input: text,
+          voice,
+          response_format: 'mp3',
+        }),
+      }));
+      if (!resp.ok) {
+        const errText = await resp.text().catch(() => '');
+        return { ok: false, error: `aihubmix speech ${resp.status}: ${errText.slice(0, 240)}` };
+      }
+      bytes = Buffer.from(await resp.arrayBuffer());
+      ext = 'mp3';
     }
-    bytes = Buffer.from(await resp.arrayBuffer());
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
   if (bytes.length === 0) return { ok: false, error: 'aihubmix speech returned zero bytes' };
 
   const id = `${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`;
-  const filename = `byok-speech-${id}.mp3`;
+  const filename = `byok-speech-${id}.${ext}`;
+  await writeFile(path.join(dir, filename), bytes);
+  return {
+    ok: true,
+    url: `/api/projects/${encodeURIComponent(ctx.projectId)}/files/${filename}`,
+  };
+}
+
+function sanitizeAIHubMixVideoAspect(raw: unknown): string {
+  return typeof raw === 'string' && AIHUBMIX_VIDEO_ASPECT_TO_SIZE[raw] ? raw : '16:9';
+}
+
+const IMAGE_EXT_MIME: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.webp': 'image/webp',
+  '.gif': 'image/gif',
+};
+
+// AIHubMix i2v takes the reference image as a multipart FILE upload (not a JSON
+// data URL), so we resolve to raw bytes + mime + filename, then attach as a Blob.
+interface ReferenceImagePart {
+  bytes: Buffer;
+  mime: string;
+  filename: string;
+}
+
+// Read a project image file into an upload part. Null for non-images / unreadable.
+async function fileToImagePart(filePath: string): Promise<ReferenceImagePart | null> {
+  const mime = IMAGE_EXT_MIME[path.extname(filePath).toLowerCase()];
+  if (!mime) return null;
+  try {
+    const buf = await readFile(filePath);
+    if (!buf.length) return null;
+    return { bytes: buf, mime, filename: path.basename(filePath) };
+  } catch {
+    return null;
+  }
+}
+
+// Resolve an i2v reference image to an upload part. `image_url` may be a daemon
+// file URL (/api/projects/<id>/files/<name>), a bare project filename, or an
+// http(s) URL. Project-local files are read straight off disk (basename-only,
+// so a crafted path can't escape the project dir); external URLs are
+// SSRF-checked then fetched.
+async function resolveAIHubMixReferenceImage(
+  imageUrl: unknown,
+  dir: string,
+  ctx: BYOKToolContext,
+): Promise<ReferenceImagePart | null> {
+  if (typeof imageUrl !== 'string' || !imageUrl.trim()) return null;
+  const raw = imageUrl.trim();
+  if (/^https?:\/\//i.test(raw)) {
+    const check = await assertExternalAssetUrl(raw);
+    if (!check.ok) return null;
+    try {
+      const resp = await fetch(raw, withToolRequestInit(ctx, { redirect: 'error' }));
+      if (!resp.ok) return null;
+      const buf = Buffer.from(await resp.arrayBuffer());
+      if (!buf.length) return null;
+      const mime = (resp.headers.get('content-type') || 'image/png').split(';')[0]!.trim();
+      const filename = path.basename(new URL(raw).pathname) || 'reference.png';
+      return { bytes: buf, mime, filename };
+    } catch {
+      return null;
+    }
+  }
+  // Treat as a project-local file. basename() strips any path so a value like
+  // "../../etc/passwd" collapses to a filename inside the project dir.
+  const name = path.basename(raw.split('?')[0]!);
+  if (!name) return null;
+  return fileToImagePart(path.join(dir, name));
+}
+
+// Fallback for i2v models when no image_url is given: the most recently
+// modified image already in the project folder (typically the uploaded
+// reference or the last generated frame).
+async function newestProjectImagePart(dir: string): Promise<ReferenceImagePart | null> {
+  try {
+    const entries = await readdir(dir);
+    const images = entries.filter((f) => IMAGE_EXT_MIME[path.extname(f).toLowerCase()]);
+    if (!images.length) return null;
+    const withMtime = await Promise.all(
+      images.map(async (f) => ({ f, m: (await stat(path.join(dir, f))).mtimeMs })),
+    );
+    withMtime.sort((a, b) => b.m - a.m);
+    return fileToImagePart(path.join(dir, withMtime[0]!.f));
+  } catch {
+    return null;
+  }
+}
+
+// AIHubMix's completed-video download URL is frequently an authenticated
+// endpoint on the AIHubMix origin itself (a bare GET returns 401). We must
+// re-send the Bearer + APP-Code headers when the asset lives on that origin,
+// but must NOT leak the key to a third-party signed CDN URL. Compare origins.
+function sameOrigin(a: string, b: string): boolean {
+  try {
+    return new URL(a).origin === new URL(b).origin;
+  } catch {
+    return false;
+  }
+}
+
+// True when two URLs share the last two host labels (registrable domain), e.g.
+// `x.aihubmix.com` and `aihubmix.com`. Used to decide whether re-sending the
+// AIHubMix key to a sibling sub-host is safe when a bare download is rejected.
+function sameRegistrableDomain(a: string, b: string): boolean {
+  try {
+    const reg = (h: string) => h.split('.').slice(-2).join('.');
+    return reg(new URL(a).hostname) === reg(new URL(b).hostname);
+  } catch {
+    return false;
+  }
+}
+
+// Resolve a model's capability from the shared media-adapters registry; for
+// catalogue models not in the seed, synthesize a sensible default (family +
+// duration set derived from the wire name). Phase 2 replaces the registry's
+// seed with a live AIHubMix /api/v1/models fetch.
+function aihubmixVideoCapabilityFor(catalogModel: string): ModelCapability {
+  const existing = aihubmixMediaRegistry.get(catalogModel);
+  if (existing) return existing;
+  const wire = aihubmixWireModel(catalogModel);
+  const lower = wire.toLowerCase();
+  const supportedDurations = lower.startsWith('veo')
+    ? [4, 6, 8]
+    : lower.startsWith('sora')
+      ? [4, 8, 12]
+      : lower.startsWith('wan')
+        ? [5, 10]
+        : undefined;
+  return {
+    id: wire,
+    apiModel: wire,
+    mediaType: 'video',
+    family: deriveVideoFamily(wire),
+    caps: lower.includes('i2v') ? ['i2v'] : ['t2v'],
+    supportedFrameImages: ['first_frame'],
+    ...(supportedDurations ? { supportedDurations } : {}),
+  };
+}
+
+/**
+ * AIHubMix in-chat video generation. Mirrors renderAIHubMixVideo (media.ts) for
+ * the wire shape — POST {base}/videos → poll GET {base}/videos/{id} → download
+ * the inline URL or {base}/videos/{id}/content — and executeGenerateVideo above
+ * for the chat-executor scaffolding (project storage, proxy dispatcher
+ * forwarding, SSRF re-validation of the returned asset URL). Supports both
+ * text-to-video and image-to-video: i2v models (id contains "i2v") take a
+ * reference image from `args.image_url` or, failing that, the newest image in
+ * the project, sent as the `input_reference` data URL.
+ */
+export async function executeAIHubMixGenerateVideo(
+  args: {
+    prompt?: unknown;
+    aspect_ratio?: unknown;
+    duration?: unknown;
+    model?: unknown;
+    image_url?: unknown;
+  },
+  ctx: BYOKToolContext,
+): Promise<ImageToolResult> {
+  const promptRaw = typeof args.prompt === 'string' ? args.prompt.trim() : '';
+  if (!promptRaw) return { ok: false, error: 'prompt is required' };
+  const prompt =
+    promptRaw.length > PROMPT_MAX_LENGTH ? promptRaw.slice(0, PROMPT_MAX_LENGTH) : promptRaw;
+
+  const aspect = sanitizeAIHubMixVideoAspect(args.aspect_ratio);
+  const size = AIHUBMIX_VIDEO_ASPECT_TO_SIZE[aspect];
+
+  // Model resolution: the user's EXPLICIT composer/Settings pick wins over the
+  // LLM's `model` arg (the LLM otherwise overrides the composer dropdown by
+  // filling its own model). Only when the user made no selection do we honour
+  // the LLM's choice, then the registry default. The allowlist guards each step.
+  const catalogModel = isAIHubMixVideoModel(ctx.defaultVideoModel)
+    ? ctx.defaultVideoModel
+    : isAIHubMixVideoModel(args.model)
+      ? args.model
+      : BYOK_AIHUBMIX_DEFAULT_VIDEO_MODEL;
+  const wireModel = aihubmixWireModel(catalogModel);
+
+  let dir: string;
+  try {
+    dir = await ensureProject(ctx.projectsRoot, ctx.projectId);
+  } catch (err) {
+    return {
+      ok: false,
+      error: `invalid projectId for video storage: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+
+  const { apiKey, baseUrl } = await resolveAIHubMixCredentials(ctx);
+  if (!apiKey) return { ok: false, error: 'no AIHubMix API key available' };
+  const trimmedBase = baseUrl.replace(/\/+$/, '');
+
+  // Image-to-video reference: i2v models (id contains "i2v") animate a first
+  // frame and FAIL ("Video generation failed") without one. Prefer the explicit
+  // image_url; for i2v fall back to the newest project image so the common
+  // "animate the image I just made/uploaded" flow works without the LLM having
+  // to thread a URL. t2v models ignore any reference.
+  const isI2V = wireModel.toLowerCase().includes('i2v');
+  let refImage = await resolveAIHubMixReferenceImage(args.image_url, dir, ctx);
+  if (!refImage && isI2V) {
+    refImage = await newestProjectImagePart(dir);
+    if (refImage) {
+      console.log('[proxy:aihubmix] generate_video i2v: no image_url; using newest project image as reference');
+    }
+  }
+  if (isI2V && !refImage) {
+    return {
+      ok: false,
+      error:
+        `${wireModel} is an image-to-video model and needs a reference image, but none was found. `
+        + 'Upload or generate an image in this project first, or pass image_url; '
+        + 'or switch to a text-to-video model.',
+    };
+  }
+
+  // Build the upstream request via the shared media-adapters layer (family-aware:
+  // seedance → multimodal content[] array, others → flat input_reference, with
+  // per-family duration snapping). Phase 1 uses the ported aihubmix-video seed;
+  // Phase 2 swaps the registry to a live AIHubMix /api/v1/models fetch.
+  const cap = aihubmixVideoCapabilityFor(catalogModel);
+  const refDataUrl = refImage
+    ? `data:${refImage.mime};base64,${refImage.bytes.toString('base64')}`
+    : undefined;
+  const built = buildVideoRequest(cap, {
+    prompt,
+    durationSeconds: sanitizeVideoDuration(args.duration),
+    aspectRatio: aspect,
+    ...(size ? { size } : {}),
+    ...(refDataUrl ? { imageRef: { dataUrl: refDataUrl } } : {}),
+  });
+
+  // Step 1: POST {base}/videos → task id. Log the actual upstream call (it's a
+  // server-side request, so it never appears in the browser Network tab).
+  console.log(
+    `[proxy:aihubmix] generate_video submit POST ${trimmedBase}${built.pathSuffix} model=${built.wireModel} family=${built.family} ref=${built.hasReference ? `yes(${refImage!.mime},${refImage!.bytes.length}b)` : 'no'}`,
+  );
+  let taskId: string;
+  try {
+    const resp = await fetch(`${trimmedBase}${built.pathSuffix}`, withToolRequestInit(ctx, {
+      method: 'POST',
+      redirect: 'error',
+      headers: { 'content-type': built.contentType, ...aihubmixHeaders(apiKey) },
+      body: JSON.stringify(built.body),
+    }));
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => '');
+      return { ok: false, error: `aihubmix video submit ${resp.status}: ${text.slice(0, 240)}` };
+    }
+    const data = (await resp.json()) as { id?: string; data?: { id?: string } };
+    const id = data?.id || data?.data?.id;
+    if (typeof id !== 'string' || !id) {
+      return { ok: false, error: 'aihubmix video response missing id' };
+    }
+    taskId = id;
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+
+  // Step 2: poll /videos/{id} until completed / failed / timeout.
+  const pollIntervalMs = ctx.videoPollIntervalMs ?? AIHUBMIX_VIDEO_POLL_INTERVAL_MS_DEFAULT;
+  let directUrl = '';
+  let done = false;
+  for (let attempt = 0; attempt < AIHUBMIX_VIDEO_MAX_POLLS; attempt++) {
+    await sleep(pollIntervalMs);
+    let statusResp: Response;
+    try {
+      statusResp = await fetch(
+        `${trimmedBase}/videos/${encodeURIComponent(taskId)}`,
+        withToolRequestInit(ctx, { method: 'GET', headers: { ...aihubmixHeaders(apiKey) } }),
+      );
+    } catch (err) {
+      return {
+        ok: false,
+        error: `aihubmix video poll failed: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+    if (!statusResp.ok) {
+      const text = await statusResp.text().catch(() => '');
+      return { ok: false, error: `aihubmix video status ${statusResp.status}: ${text.slice(0, 240)}` };
+    }
+    const data = (await statusResp.json()) as any;
+    const status: string = data?.status || data?.data?.status || '';
+    if (status === 'completed' || status === 'succeeded' || status === 'done') {
+      // Some gateways surface the asset URL inline; otherwise fall back to the
+      // /content download endpoint below.
+      directUrl =
+        data?.video_url
+        || data?.url
+        || data?.output_url
+        || data?.data?.video_url
+        || data?.data?.url
+        || (Array.isArray(data?.data) ? data.data[0]?.url : '')
+        || '';
+      done = true;
+      break;
+    }
+    if (status === 'failed' || status === 'cancelled' || status === 'error') {
+      // Dump the full upstream payload — the surfaced reason is often just the
+      // opaque "Video generation failed"; the body may carry a code / detail
+      // (e.g. an unsupported model or a bad reference image) that we need to
+      // diagnose without re-running a billed generation.
+      let dump = '';
+      try { dump = JSON.stringify(data); } catch { dump = String(data); }
+      console.warn(
+        `[proxy:aihubmix] generate_video upstream ${status} model=${wireModel} body=${dump.slice(0, 600)}`,
+      );
+      const reason = String(
+        data?.error?.message || data?.error || data?.failure_reason
+        || data?.data?.error?.message || data?.message || '',
+      );
+      // "Params ignored" signature: we sent a real prompt but the upstream echo
+      // shows it empty (and the only error is the generic catch-all). That means
+      // AIHubMix accepted the request but didn't map our fields onto this model
+      // — i.e. the model isn't wired into the unified /videos schema (observed
+      // for the whole happyhorse-* family). Turn the opaque failure into an
+      // actionable message instead of relaying "Video generation failed".
+      const promptEchoedEmpty = typeof data?.prompt === 'string' && data.prompt === '' && prompt.length > 0;
+      const genericOnly = !reason || /^video generation failed\.?$/i.test(reason.trim());
+      if (promptEchoedEmpty && genericOnly) {
+        // Two distinct causes share this "params dropped" signature:
+        //  - With a reference image: the model didn't accept the multipart file
+        //    upload (e.g. happyhorse i2v/r2v want a public image_url URL, not a
+        //    multipart part — and our local project files aren't reachable by
+        //    AIHubMix anyway). Its text-to-video variant may still work.
+        //  - Without one: the model isn't wired into the unified schema at all.
+        const error = refImage
+          ? `${wireModel} did not accept the uploaded reference image — AIHubMix dropped the request `
+            + `parameters and it failed with no specific reason. This model likely isn't wired for `
+            + `image-to-video on AIHubMix's unified /videos endpoint. Use doubao-seedance-2-0-260128 `
+            + `for image-to-video; ${wireModel.replace(/-(i2v|r2v)$/, '-t2v')} may still work for text-to-video.`
+          : `${wireModel} is not supported by AIHubMix's unified video API — it ignored the request `
+            + `parameters (the prompt came back empty) and failed with no specific reason. Switch to a `
+            + `supported model such as doubao-seedance-2-0-260128, sora-2, or a wan2.x model.`;
+        return { ok: false, error };
+      }
+      return {
+        ok: false,
+        error: `aihubmix video ${status}: ${(reason || status).slice(0, 240)}`,
+      };
+    }
+    if ((attempt + 1) % AIHUBMIX_VIDEO_PROGRESS_LOG_EVERY === 0) {
+      console.log(
+        `[proxy:aihubmix] generate_video poll ${attempt + 1}/${AIHUBMIX_VIDEO_MAX_POLLS} task=${taskId} status=${status || 'pending'}`,
+      );
+    }
+  }
+  if (!done) {
+    return { ok: false, error: `aihubmix video timed out after ${AIHUBMIX_VIDEO_MAX_POLLS} polls` };
+  }
+
+  // Step 3: download the mp4 bytes. Re-validate any returned URL through
+  // assertExternalAssetUrl so a malicious gateway can't point us at the cloud
+  // metadata service or an RFC1918 host via the response payload.
+  console.log(
+    `[proxy:aihubmix] generate_video completed task=${taskId} download=${directUrl || `${trimmedBase}/videos/${encodeURIComponent(taskId)}/content`}`,
+  );
+  let bytes: Buffer;
+  try {
+    if (directUrl) {
+      const urlCheck = await assertExternalAssetUrl(directUrl);
+      if (!urlCheck.ok) return { ok: false, error: urlCheck.error };
+      // Authenticated download when the asset is on the AIHubMix origin;
+      // a signed third-party CDN URL is fetched without our key. Redirects
+      // are followed so an AIHubMix URL can hand off to a signed CDN.
+      let host = '';
+      try { host = new URL(directUrl).host; } catch { /* keep host empty */ }
+      const sendAuth = sameOrigin(directUrl, trimmedBase);
+      let dl = await fetch(
+        directUrl,
+        withToolRequestInit(ctx, sendAuth ? { headers: { ...aihubmixHeaders(apiKey) } } : {}),
+      );
+      // Fallback: an unauthenticated download rejected as 401/403 from the same
+      // registrable domain (e.g. a different AIHubMix sub-host) is retried with
+      // the key — the asset was clearly meant to be fetched authenticated.
+      if (!dl.ok && !sendAuth && (dl.status === 401 || dl.status === 403)
+          && sameRegistrableDomain(directUrl, trimmedBase)) {
+        dl = await fetch(directUrl, withToolRequestInit(ctx, { headers: { ...aihubmixHeaders(apiKey) } }));
+      }
+      if (!dl.ok) return { ok: false, error: `aihubmix video download ${dl.status} (${host})` };
+      bytes = Buffer.from(await dl.arrayBuffer());
+    } else {
+      const contentResp = await fetch(
+        `${trimmedBase}/videos/${encodeURIComponent(taskId)}/content`,
+        withToolRequestInit(ctx, { headers: { ...aihubmixHeaders(apiKey) } }),
+      );
+      if (!contentResp.ok) {
+        return { ok: false, error: `aihubmix video content ${contentResp.status}` };
+      }
+      bytes = Buffer.from(await contentResp.arrayBuffer());
+    }
+  } catch (err) {
+    return {
+      ok: false,
+      error: `aihubmix video download failed: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  if (bytes.length === 0) return { ok: false, error: 'aihubmix video returned zero bytes' };
+
+  const id = `${Date.now().toString(36)}-${randomBytes(4).toString('hex')}`;
+  const filename = `byok-video-${id}.mp4`;
   await writeFile(path.join(dir, filename), bytes);
   return {
     ok: true,

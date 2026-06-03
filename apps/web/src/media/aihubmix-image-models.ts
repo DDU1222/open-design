@@ -16,7 +16,7 @@
 // exposed via hooks so every picker shows the same list without each surface
 // issuing its own request.
 import { useEffect, useMemo, useState } from 'react';
-import { IMAGE_MODELS, type MediaModel } from './models';
+import { IMAGE_MODELS, VIDEO_MODELS, AUDIO_MODELS_BY_KIND, type MediaModel } from './models';
 
 type FetchedModel = { id: string; label: string };
 
@@ -164,4 +164,48 @@ export function useByokImageModelOptions(
     }
     return IMAGE_MODELS.filter((m) => m.provider === provider);
   }, [provider, dynamic]);
+}
+
+/**
+ * Shared option list for the BYOK video-model pickers (Settings + the chat
+ * composer's inline picker). For AIHubMix it returns the live `?type=video`
+ * catalogue (with static seeds as fallback); for any other provider it returns
+ * that provider's static VIDEO_MODELS entries. Mirrors useByokImageModelOptions.
+ */
+export function useByokVideoModelOptions(
+  provider: string | undefined,
+): MediaModel[] {
+  const dynamic = useAIHubMixVideoModels();
+  return useMemo(() => {
+    if (provider === 'aihubmix') {
+      return mergeAihubmixModels(VIDEO_MODELS, dynamic).filter(
+        (m) => m.provider === 'aihubmix',
+      );
+    }
+    return VIDEO_MODELS.filter((m) => m.provider === provider);
+  }, [provider, dynamic]);
+}
+
+/**
+ * Shared option list for the BYOK speech (TTS) model picker. For AIHubMix it
+ * returns the live `?type=tts` catalogue (static speech seeds as fallback); for
+ * other providers, that provider's static speech entries. Mirrors the image/
+ * video option hooks.
+ */
+export function useByokSpeechModelOptions(
+  provider: string | undefined,
+): MediaModel[] {
+  const dynamic = useAIHubMixAudioModels();
+  const speechSeeds = useMemo(
+    () => AUDIO_MODELS_BY_KIND.speech,
+    [],
+  );
+  return useMemo(() => {
+    if (provider === 'aihubmix') {
+      return mergeAihubmixModels(speechSeeds, dynamic).filter(
+        (m) => m.provider === 'aihubmix',
+      );
+    }
+    return speechSeeds.filter((m) => m.provider === provider);
+  }, [provider, dynamic, speechSeeds]);
 }

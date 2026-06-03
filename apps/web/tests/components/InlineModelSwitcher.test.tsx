@@ -4,7 +4,12 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testi
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { InlineModelSwitcher } from '../../src/components/InlineModelSwitcher';
 import { AMR_LOGIN_TIMEOUT_MS } from '../../src/components/amrLoginPolling';
+import { fetchProviderModels } from '../../src/providers/provider-models';
 import type { AgentInfo, AppConfig, ProviderModelOption } from '../../src/types';
+
+vi.mock('../../src/providers/provider-models', () => ({
+  fetchProviderModels: vi.fn(),
+}));
 
 const baseConfig: AppConfig = {
   mode: 'daemon',
@@ -71,6 +76,7 @@ function renderSwitcher(
 describe('InlineModelSwitcher AMR row', () => {
   afterEach(() => {
     cleanup();
+    vi.mocked(fetchProviderModels).mockReset();
     vi.unstubAllGlobals();
     vi.useRealTimers();
     try {
@@ -322,6 +328,190 @@ describe('InlineModelSwitcher AMR row', () => {
       within(modelPopover).getAllByRole('option').map((option) => option.textContent?.trim()),
     ).toEqual(expect.arrayContaining(['gpt-4.1-mini', 'gpt-4.1', 'gpt-5.5']));
     expect(within(modelPopover).getAllByRole('option').length).toBeGreaterThan(1);
+  });
+
+  it('warms the shared provider-models cache from the home picker for keyless AIHubMix', async () => {
+    // Regression: the home picker only READ the cache, so on a fresh load (no
+    // Settings/onboarding fetch yet) the AIHubMix BYOK list fell back to the
+    // small static seed list. It must fetch the live catalogue itself. AIHubMix
+    // is keyless, so the fetch fires with an empty apiKey.
+    const fetchMock = vi.mocked(fetchProviderModels);
+    fetchMock.mockResolvedValue({
+      ok: true,
+      kind: 'success',
+      latencyMs: 1,
+      models: [
+        { id: 'claude-opus-4-8', label: 'claude-opus-4-8' },
+        { id: 'gemini-3.5-flash', label: 'gemini-3.5-flash' },
+        { id: 'minimax-m3', label: 'minimax-m3' },
+      ],
+    });
+    const onProviderModelsCacheChange = vi.fn();
+    render(
+      <InlineModelSwitcher
+        config={{
+          ...baseConfig,
+          mode: 'api',
+          apiProtocol: 'aihubmix',
+          baseUrl: 'https://aihubmix.com/v1',
+          apiProviderBaseUrl: 'https://aihubmix.com/v1',
+          apiKey: '',
+          model: 'claude-opus-4-8',
+        }}
+        agents={[amrAgent, codexAgent]}
+        daemonLive={true}
+        onModeChange={vi.fn()}
+        onAgentChange={vi.fn()}
+        onAgentModelChange={vi.fn()}
+        onApiProtocolChange={vi.fn()}
+        onApiModelChange={vi.fn()}
+        providerModelsCache={{}}
+        onProviderModelsCacheChange={onProviderModelsCacheChange}
+        onOpenSettings={vi.fn()}
+      />,
+    );
+
+    // No fetch until the user opens the switcher panel.
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByTestId('inline-model-switcher-chip'));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith({
+        protocol: 'aihubmix',
+        baseUrl: 'https://aihubmix.com/v1',
+        apiKey: '',
+      });
+      expect(onProviderModelsCacheChange).toHaveBeenCalled();
+    });
+
+    // The updater populates the slot under the Settings-shared cache key, so
+    // one fetch serves both surfaces.
+    const updater = onProviderModelsCacheChange.mock.calls[0]![0] as (
+      current: Record<string, ProviderModelOption[]>,
+    ) => Record<string, ProviderModelOption[]>;
+    const key = ['aihubmix', 'https://aihubmix.com/v1', '', ''].join('\n');
+    const next = updater({});
+    expect(next[key]?.map((m) => m.id)).toEqual([
+      'claude-opus-4-8',
+      'gemini-3.5-flash',
+      'minimax-m3',
+    ]);
+  });
+
+  it('does not fetch from the home picker for a keyed protocol with no API key', async () => {
+    const fetchMock = vi.mocked(fetchProviderModels);
+    render(
+      <InlineModelSwitcher
+        config={{
+          ...baseConfig,
+          mode: 'api',
+          apiProtocol: 'openai',
+          baseUrl: 'https://api.openai.com/v1',
+          apiProviderBaseUrl: 'https://api.openai.com/v1',
+          apiKey: '',
+          model: 'gpt-4.1-mini',
+        }}
+        agents={[amrAgent, codexAgent]}
+        daemonLive={true}
+        onModeChange={vi.fn()}
+        onAgentChange={vi.fn()}
+        onAgentModelChange={vi.fn()}
+        onApiProtocolChange={vi.fn()}
+        onApiModelChange={vi.fn()}
+        providerModelsCache={{}}
+        onProviderModelsCacheChange={vi.fn()}
+        onOpenSettings={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByTestId('inline-model-switcher-chip'));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('lists AIHubMix as a BYOK provider chip and marks it active when selected', () => {
+    const onApiProtocolChange = vi.fn();
+    render(
+      <InlineModelSwitcher
+        config={{
+          ...baseConfig,
+          mode: 'api',
+          apiProtocol: 'aihubmix',
+          baseUrl: 'https://aihubmix.com/v1',
+          apiProviderBaseUrl: 'https://aihubmix.com/v1',
+          apiKey: '',
+          model: 'gemini-3.5-flash',
+        }}
+        agents={[amrAgent, codexAgent]}
+        daemonLive={true}
+        onModeChange={vi.fn()}
+        onAgentChange={vi.fn()}
+        onAgentModelChange={vi.fn()}
+        onApiProtocolChange={onApiProtocolChange}
+        onApiModelChange={vi.fn()}
+        providerModelsCache={{}}
+        onOpenSettings={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByTestId('inline-model-switcher-chip'));
+    const chip = screen.getByTestId('inline-model-switcher-provider-aihubmix');
+    expect(chip.getAttribute('aria-selected')).toBe('true');
+  });
+
+  it('keeps the panel open and applies the choice when picking a BYOK model from the portaled list', async () => {
+    // Regression: the model list renders in a portal on `document.body`, so a
+    // mousedown on an option lands OUTSIDE the switcher's `wrapRef`. The panel's
+    // outside-click handler used to close the whole panel on that mousedown,
+    // unmounting the picker before its click fired — the model never changed.
+    const onApiModelChange = vi.fn();
+    render(
+      <InlineModelSwitcher
+        config={{
+          ...baseConfig,
+          mode: 'api',
+          apiProtocol: 'openai',
+          baseUrl: 'https://api.openai.com/v1',
+          apiProviderBaseUrl: 'https://api.openai.com/v1',
+          apiKey: 'sk-test',
+          model: 'gpt-4.1-mini',
+        }}
+        agents={[amrAgent, codexAgent]}
+        daemonLive={true}
+        onModeChange={vi.fn()}
+        onAgentChange={vi.fn()}
+        onAgentModelChange={vi.fn()}
+        onApiProtocolChange={vi.fn()}
+        onApiModelChange={onApiModelChange}
+        providerModelsCache={{
+          ['openai\nhttps://api.openai.com/v1\nsk-test\n']: [
+            { id: 'gpt-4.1-mini', label: 'gpt-4.1-mini' },
+            { id: 'gpt-4.1', label: 'gpt-4.1' },
+            { id: 'gpt-5.5', label: 'gpt-5.5' },
+          ],
+        }}
+        onOpenSettings={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('inline-model-switcher-chip'));
+    fireEvent.click(screen.getByTestId('inline-model-switcher-api-model'));
+
+    const modelPopover = screen.getByTestId('inline-model-switcher-api-model-popover');
+    const option = within(modelPopover).getByRole('option', { name: 'gpt-5.5' });
+
+    // The real browser fires mousedown before the option's click. The panel's
+    // document-level mousedown listener must NOT treat this portal click as
+    // "outside" and close the switcher.
+    fireEvent.mouseDown(option);
+    expect(screen.queryByTestId('inline-model-switcher-popover')).not.toBeNull();
+    expect(
+      screen.queryByTestId('inline-model-switcher-api-model-popover'),
+    ).not.toBeNull();
+
+    fireEvent.click(option);
+    expect(onApiModelChange).toHaveBeenCalledWith('gpt-5.5');
   });
 
   it('treats env-backed AMR login as signed in even when no user profile is available', async () => {

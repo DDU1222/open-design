@@ -294,6 +294,11 @@ export const ar: Dict = {
     'في Azure OpenAI، يُستخدم هذا الحقل كاسم النشر في /openai/deployments/<model>. أدخل اسم النشر الذي أنشأته في Azure.',
   'settings.apiVersion': 'إصدار API',
   'settings.byokImageModel': 'نموذج إنشاء الصور',
+  'settings.byokVideoModel': 'نموذج إنشاء الفيديو',
+  'settings.byokVideoI2vHint': 'نموذج صورة-إلى-فيديو: مطلوب صورة مرجعية (يُستخدم أحدث صورة في المشروع تلقائيًا إن لم تحددها)',
+  'settings.byokSpeechModel': 'نموذج توليد الصوت',
+  'settings.byokSpeechVoice': 'صوت الكلام',
+  'settings.byokModelDefaultOption': 'افتراضي',
   'settings.maxTokens': 'أقصى عدد من الرموز (اختياري)',
   'settings.maxTokensHint':
     'الحد الأقصى لطول الاستجابة. لكل نموذج قيمة افتراضية؛ اتركها فارغة لاستخدامها، أو أدخل رقماً للتجاوز.',

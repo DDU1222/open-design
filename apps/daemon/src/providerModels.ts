@@ -197,7 +197,11 @@ function providerModelsHeaders(
 function extractModels(protocol: ConnectionTestProtocol, data: unknown): ProviderModelOption[] {
   // SenseAudio's /v1/models response follows the OpenAI envelope
   // (`{ data: [{ id, ... }] }`), so the same extractor handles both.
-  if (protocol === 'aihubmix') return parseAIHubMixCatalog(data);
+  // Chat picker: drop media-generation rows. AIHubMix's `?type=llm` matches any
+  // model whose `types` merely contains `llm`, so dual-tagged image models
+  // (e.g. gpt-image-2 → "image_generation,llm") would otherwise leak in. Those
+  // belong to the dedicated image/video/audio pickers.
+  if (protocol === 'aihubmix') return parseAIHubMixCatalog(data, { chatOnly: true });
   if (protocol === 'openai' || protocol === 'senseaudio') return extractOpenAiModels(data);
   if (protocol === 'anthropic') return extractAnthropicModels(data);
   if (protocol === 'google') return extractGoogleModels(data);

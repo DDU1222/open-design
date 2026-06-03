@@ -305,6 +305,11 @@ export const zhCN: Dict = {
     '对于 Azure OpenAI，请填写你在 Azure 中创建的部署名称。当前 BYOK 端点无法自动发现 deployment。',
   'settings.apiVersion': 'API 版本',
   'settings.byokImageModel': '图片生成模型',
+  'settings.byokVideoModel': '视频生成模型',
+  'settings.byokVideoI2vHint': '图生视频模型:需要参考图(不指定时自动使用项目中最新的图片)',
+  'settings.byokSpeechModel': '语音生成模型',
+  'settings.byokSpeechVoice': '音色',
+  'settings.byokModelDefaultOption': '默认',
   'settings.maxTokens': '最大 tokens（可选）',
   'settings.maxTokensHint':
     '响应长度上限。每个 model 有调优过的默认值（在 placeholder 里显示），留空即使用，输入数字则覆盖。',

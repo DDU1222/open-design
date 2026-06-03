@@ -104,6 +104,35 @@ export function aihubmixWireModel(catalogId: string): string {
   return AIHUBMIX_WIRE_MODELS[catalogId] ?? catalogId.replace(/^aihubmix-/, '');
 }
 
+// AIHubMix's unified /videos API uses a single `seconds` (string) field for
+// every model family, but the *valid values* differ per family — an
+// out-of-set duration 400s (e.g. Veo rejects 5; only 4/6/8 are allowed, which
+// AIHubMix forwards to Google's native `durationSeconds`). Snap the requested
+// duration to the family's nearest allowed value (ties prefer the shorter one).
+//   veo:  4, 6, 8   (default 8)
+//   sora: 4, 8, 12  (default 4)
+//   wan:  5, 10     (default 5)
+//   seedance/doubao + unknown: accepts a range — clamp to 3–12.
+// `wireModel` is the upstream name (prefix already stripped).
+export function aihubmixVideoSeconds(wireModel: string, requested: number): string {
+  const m = (wireModel || '').toLowerCase();
+  const req = Number.isFinite(requested) ? requested : 5;
+  let allowed: number[] | null = null;
+  if (m.startsWith('veo')) allowed = [4, 6, 8];
+  else if (m.startsWith('sora')) allowed = [4, 8, 12];
+  else if (m.startsWith('wan')) allowed = [5, 10];
+  if (!allowed) {
+    // Seedance/doubao and unknown families take a continuous range.
+    return String(Math.min(12, Math.max(3, Math.round(req))));
+  }
+  // Nearest allowed value; strict `<` keeps the first (smaller) on a tie.
+  const snapped = allowed.reduce(
+    (best, v) => (Math.abs(v - req) < Math.abs(best - req) ? v : best),
+    allowed[0]!,
+  );
+  return String(snapped);
+}
+
 // AIHubMix publishes its catalogue on a NON-OpenAI endpoint:
 //   GET https://aihubmix.com/api/v1/models?type=llm
 //   GET https://aihubmix.com/api/v1/models?type=image_generation
@@ -128,9 +157,38 @@ export interface AIHubMixCatalogModel {
   label: string;
 }
 
+// AIHubMix tags every catalogue row with a comma-separated `types` field
+// (e.g. "llm", "llm,search", "image_generation,llm"). These are the
+// media-generation capabilities that belong to the dedicated image/video/audio
+// pickers — NOT the chat model picker.
+const AIHUBMIX_MEDIA_GENERATION_TYPES = new Set(['image_generation', 'video', 'tts']);
+
+function aihubmixRowTypes(row: unknown): string[] {
+  const raw = (row as { types?: unknown })?.types;
+  if (typeof raw !== 'string') return [];
+  return raw
+    .split(',')
+    .map((t) => t.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+export interface ParseAIHubMixCatalogOptions {
+  /** Keep only genuine chat models, dropping media-generation rows. AIHubMix's
+   *  `?type=llm` query matches any model whose `types` merely CONTAINS `llm`, so
+   *  dual-tagged image models (e.g. `gpt-image-2` → "image_generation,llm") leak
+   *  into the chat catalogue. The chat model picker passes this; the media
+   *  pickers (which query `?type=image_generation` / `video` / `tts`) leave it
+   *  off so their own catalogues stay intact. Rows with no `types` are kept —
+   *  absent metadata shouldn't hide an otherwise-valid chat model. */
+  chatOnly?: boolean;
+}
+
 /** Parse the AIHubMix catalogue envelope into { id, label } options. Reads
  *  `model_id` (the wire name sent as `model`) and `model_name` (display). */
-export function parseAIHubMixCatalog(data: unknown): AIHubMixCatalogModel[] {
+export function parseAIHubMixCatalog(
+  data: unknown,
+  options?: ParseAIHubMixCatalogOptions,
+): AIHubMixCatalogModel[] {
   const rows = (data as { data?: unknown })?.data;
   if (!Array.isArray(rows)) return [];
   const seen = new Set<string>();
@@ -140,6 +198,12 @@ export function parseAIHubMixCatalog(data: unknown): AIHubMixCatalogModel[] {
       ? (row as { model_id: string }).model_id
       : '';
     if (!id || seen.has(id)) continue;
+    if (
+      options?.chatOnly &&
+      aihubmixRowTypes(row).some((t) => AIHUBMIX_MEDIA_GENERATION_TYPES.has(t))
+    ) {
+      continue;
+    }
     seen.add(id);
     const name = typeof (row as { model_name?: unknown })?.model_name === 'string'
       ? (row as { model_name: string }).model_name

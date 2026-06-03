@@ -594,6 +594,7 @@ export function EntryShell({
               </a>
               <InlineModelSwitcher
                 providerModelsCache={sharedProviderModelsCache}
+                onProviderModelsCacheChange={onProviderModelsCacheChange}
                 config={config}
                 agents={agents}
                 daemonLive={daemonLive}

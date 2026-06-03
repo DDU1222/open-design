@@ -15,8 +15,11 @@ import {
   executeGenerateVideo,
   executeAIHubMixGenerateImage,
   executeAIHubMixGenerateSpeech,
+  executeAIHubMixGenerateVideo,
   isSenseAudioImageModel,
   isAIHubMixImageModel,
+  isAIHubMixVideoModel,
+  isAIHubMixSpeechModel,
   type BYOKToolContext,
   type ImageToolResult,
 } from './byok-tools.js';
@@ -1333,6 +1336,11 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
     tools: any[];
     buildHeaders: (apiKey: string) => Record<string, string>;
     isImageModel: (value: unknown) => boolean;
+    /** Validates the per-request `byokVideoModel` default before it is fed to
+     *  the `generate_video` tool. Omitted when the provider has no video tool. */
+    isVideoModel?: (value: unknown) => boolean;
+    /** Validates the per-request `byokSpeechModel` default for the speech tool. */
+    isSpeechModel?: (value: unknown) => boolean;
     runImage: ByokToolRunner;
     runSpeech: ByokToolRunner;
     /** Omitted when the provider has no video endpoint (AIHubMix). */
@@ -1364,6 +1372,9 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
       maxTokens,
       projectId,
       byokImageModel,
+      byokVideoModel,
+      byokSpeechModel,
+      byokSpeechVoice,
     } = proxyBody;
     if (!apiKey || !model) {
       return sendApiError(
@@ -1435,8 +1446,10 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
     }
 
     const url = appendVersionedApiPath(effectiveBaseUrl, '/chat/completions');
+    // Log protocol + full endpoint (like the anthropic/gemini branches above) so
+    // multi-model switching is auditable: which model hit which wire endpoint.
     console.log(
-      `[${opts.logTag}] ${req.method} ${validated.parsed?.hostname ?? '?'} model=${model} project=${projectId}`,
+      `[${opts.logTag}] ${req.method} openai ${url} model=${model} project=${projectId}`,
     );
 
     const workingMessages: any[] = Array.isArray(messages) ? [...messages] : [];
@@ -1457,6 +1470,20 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
     const validDefaultImageModel = opts.isImageModel(byokImageModel)
       ? byokImageModel
       : undefined;
+    // Same treatment for the BYOK default video model (only providers with a
+    // `generate_video` tool supply `isVideoModel`).
+    const validDefaultVideoModel = opts.isVideoModel?.(byokVideoModel)
+      ? byokVideoModel
+      : undefined;
+    // Speech model is validated like image/video; the voice is a free string
+    // (a voice id), so it is passed through as-is when present.
+    const validDefaultSpeechModel = opts.isSpeechModel?.(byokSpeechModel)
+      ? byokSpeechModel
+      : undefined;
+    const validDefaultSpeechVoice =
+      typeof byokSpeechVoice === 'string' && byokSpeechVoice.trim()
+        ? byokSpeechVoice.trim()
+        : undefined;
 
     let proxyDispatcher: ReturnType<typeof proxyDispatcherRequestInit> | null = null;
 
@@ -1473,6 +1500,15 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
       // allowlist anyway, so a missing key and an undefined value behave the same.
       ...(validDefaultImageModel
         ? { defaultImageModel: validDefaultImageModel }
+        : {}),
+      ...(validDefaultVideoModel
+        ? { defaultVideoModel: validDefaultVideoModel }
+        : {}),
+      ...(validDefaultSpeechModel
+        ? { defaultSpeechModel: validDefaultSpeechModel }
+        : {}),
+      ...(validDefaultSpeechVoice
+        ? { defaultSpeechVoice: validDefaultSpeechVoice }
         : {}),
     };
 
@@ -1762,7 +1798,8 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
   //   gemini*/imagen*→ Gemini :streamGenerateContent (base chat, no tools yet)
   //   everything else→ OpenAI /v1/chat/completions WITH the tool loop below
   // All on the AIHubMix origin + APP-Code. The OpenAI family keeps in-chat
-  // generate_image (/v1/images/generations) + TTS (/v1/audio/speech).
+  // generate_image (/v1/images/generations) + TTS (/v1/audio/speech) + video
+  // (async /v1/videos submit→poll→download).
   registerByokToolChatProxy('/api/proxy/aihubmix/stream', {
     providerId: 'aihubmix',
     logTag: 'proxy:aihubmix',
@@ -1770,8 +1807,11 @@ export function registerChatRoutes(app: Express, ctx: RegisterChatRoutesDeps) {
     tools: BYOK_AIHUBMIX_TOOLS,
     buildHeaders: (apiKey) => aihubmixHeaders(apiKey),
     isImageModel: isAIHubMixImageModel,
+    isVideoModel: isAIHubMixVideoModel,
+    isSpeechModel: isAIHubMixSpeechModel,
     runImage: executeAIHubMixGenerateImage,
     runSpeech: executeAIHubMixGenerateSpeech,
+    runVideo: executeAIHubMixGenerateVideo,
     routeByModel: true,
   });
 

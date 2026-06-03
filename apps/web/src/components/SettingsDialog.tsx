@@ -86,7 +86,7 @@ import {
   fetchLatestGithubReleaseInfo,
 } from '../providers/registry';
 import { MEDIA_PROVIDERS } from '../media/models';
-import { useByokImageModelOptions } from '../media/aihubmix-image-models';
+import { useByokImageModelOptions, useByokVideoModelOptions, useByokSpeechModelOptions } from '../media/aihubmix-image-models';
 import { XaiOAuthControl } from './XaiOAuthControl';
 import type { MediaProvider } from '../media/models';
 import { Toast } from './Toast';
@@ -618,6 +618,9 @@ function currentApiProtocolConfig(config: AppConfig): ApiProtocolConfig {
     apiVersion: config.apiVersion ?? '',
     apiProviderBaseUrl: config.apiProviderBaseUrl ?? null,
     byokImageModel: config.byokImageModel ?? '',
+    byokVideoModel: config.byokVideoModel ?? '',
+    byokSpeechModel: config.byokSpeechModel ?? '',
+    byokSpeechVoice: config.byokSpeechVoice ?? '',
   };
 }
 
@@ -642,6 +645,15 @@ function applyApiProtocolConfig(
       protocol === 'senseaudio' || protocol === 'aihubmix'
         ? (apiConfig.byokImageModel ?? '')
         : '',
+    // byokVideoModel only applies to AIHubMix today (the only BYOK chat with a
+    // video-model picker; SenseAudio's video tool uses a fixed model).
+    byokVideoModel:
+      protocol === 'aihubmix' ? (apiConfig.byokVideoModel ?? '') : '',
+    // Speech model + voice also AIHubMix-only today.
+    byokSpeechModel:
+      protocol === 'aihubmix' ? (apiConfig.byokSpeechModel ?? '') : '',
+    byokSpeechVoice:
+      protocol === 'aihubmix' ? (apiConfig.byokSpeechVoice ?? '') : '',
   };
 }
 
@@ -1918,6 +1930,8 @@ export function SettingsDialog({
   // Shared hook: live AIHubMix catalogue for aihubmix, static registry for
   // other providers (same list the chat composer's image picker uses).
   const byokImageModelOptions = useByokImageModelOptions(apiProtocol);
+  const byokVideoModelOptions = useByokVideoModelOptions(apiProtocol);
+  const byokSpeechModelOptions = useByokSpeechModelOptions(apiProtocol);
   const apiModelIds = useMemo(
     () => apiModelOptions.map((m) => m.id),
     [apiModelOptions],
@@ -3547,12 +3561,74 @@ export function SettingsDialog({
                         Listing it explicitly lets the picker show what the
                         unconfigured state actually means. */}
                     <option value="">
-                      {byokImageModelOptions[0]?.label ?? 'default'}
-                      {' (default)'}
+                      {byokImageModelOptions[0]?.label
+                        ? `${byokImageModelOptions[0].label} (${t('settings.byokModelDefaultOption')})`
+                        : t('settings.byokModelDefaultOption')}
                     </option>
                     {byokImageModelOptions.map((m) => (
                       <option key={m.id} value={m.id}>
                         {m.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ) : null}
+              {apiProtocol === 'aihubmix' ? (
+                <label className="field">
+                  <span className="field-label">{t('settings.byokVideoModel')}</span>
+                  <select
+                    value={cfg.byokVideoModel ?? ''}
+                    onChange={(e) =>
+                      updateApiConfig({ byokVideoModel: e.target.value })
+                    }
+                  >
+                    {/* Empty resolves to the default video model on the daemon
+                        side. The LLM can still override per-call via the tool's
+                        `model` arg. */}
+                    <option value="">
+                      {byokVideoModelOptions[0]?.label
+                        ? `${byokVideoModelOptions[0].label} (${t('settings.byokModelDefaultOption')})`
+                        : t('settings.byokModelDefaultOption')}
+                    </option>
+                    {byokVideoModelOptions.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ) : null}
+              {apiProtocol === 'aihubmix' ? (
+                <label className="field">
+                  <span className="field-label">{t('settings.byokSpeechModel')}</span>
+                  <select
+                    value={cfg.byokSpeechModel ?? ''}
+                    onChange={(e) => updateApiConfig({ byokSpeechModel: e.target.value })}
+                  >
+                    <option value="">
+                      {byokSpeechModelOptions[0]?.label
+                        ? `${byokSpeechModelOptions[0].label} (${t('settings.byokModelDefaultOption')})`
+                        : t('settings.byokModelDefaultOption')}
+                    </option>
+                    {byokSpeechModelOptions.map((m) => (
+                      <option key={m.id} value={m.id}>
+                        {m.label}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              ) : null}
+              {apiProtocol === 'aihubmix' ? (
+                <label className="field">
+                  <span className="field-label">{t('settings.byokSpeechVoice')}</span>
+                  <select
+                    value={cfg.byokSpeechVoice ?? ''}
+                    onChange={(e) => updateApiConfig({ byokSpeechVoice: e.target.value })}
+                  >
+                    <option value="">alloy (default)</option>
+                    {['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'].map((v) => (
+                      <option key={v} value={v}>
+                        {v}
                       </option>
                     ))}
                   </select>

@@ -75,6 +75,7 @@ import {
   AIHUBMIX_DEFAULT_BASE_URL,
   aihubmixHeaders,
   aihubmixWireModel,
+  aihubmixVideoSeconds,
 } from './aihubmix.js';
 
 const execFile = promisify(execFileCb);
@@ -3029,7 +3030,9 @@ async function renderAIHubMixVideo(
   const baseUrl = (credentials.baseUrl || AIHUBMIX_DEFAULT_BASE_URL).replace(/\/$/, '');
   const wireModel = aihubmixWireModel(credentials.model || ctx.wireModel);
   const size = aihubmixVideoSizeFor(ctx.aspect);
-  const seconds = String(ctx.length || 5);
+  // Snap to the model family's allowed duration set (Veo: 4/6/8, Sora: 4/8/12,
+  // wan: 5/10) so an out-of-set value isn't rejected upstream.
+  const seconds = aihubmixVideoSeconds(wireModel, ctx.length || 5);
 
   const body: Record<string, unknown> = {
     model: wireModel,
@@ -3123,7 +3126,23 @@ async function renderAIHubMixVideo(
   if (directUrl) {
     const urlCheck = await assertExternalAssetUrl(directUrl);
     if (!urlCheck.ok) throw new Error(urlCheck.error);
-    const dl = await fetch(directUrl, withMediaRequestInit(ctx));
+    // AIHubMix's completed-video URL is often an authenticated endpoint on the
+    // AIHubMix origin (a bare GET returns 401). Re-send the Bearer + APP-Code
+    // headers when the asset is same-origin; a signed third-party CDN URL is
+    // fetched without our key.
+    let sameOriginAsBase = false;
+    try {
+      sameOriginAsBase = new URL(directUrl).origin === new URL(baseUrl).origin;
+    } catch {
+      sameOriginAsBase = false;
+    }
+    const dl = await fetch(
+      directUrl,
+      withMediaRequestInit(
+        ctx,
+        sameOriginAsBase ? { headers: { ...aihubmixHeaders(credentials.apiKey) } } : {},
+      ),
+    );
     if (!dl.ok) throw new Error(`aihubmix video fetch ${dl.status}`);
     bytes = Buffer.from(await dl.arrayBuffer());
   } else {
