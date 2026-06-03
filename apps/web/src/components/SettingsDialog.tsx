@@ -9,6 +9,7 @@ import {
   settingsSectionToTracking,
 } from '@open-design/contracts/analytics';
 import { useAnalytics } from '../analytics/provider';
+import { recordAmrEntry } from '../analytics/amr-attribution';
 import {
   trackSettingsAppearanceClick,
   trackSettingsByokModelsFetchResult,
@@ -3301,6 +3302,9 @@ export function SettingsDialog({
                                       cli_provider_id: agentIdToTracking(a.id),
                                       install_status: 'installed',
                                     });
+                                    if (isAmrAgent) {
+                                      recordAmrEntry(analytics.track, 'settings_amr_agent_card');
+                                    }
                                     setCfg((c) => ({ ...c, agentId: a.id }));
                                   }}
                                   aria-pressed={active}
@@ -3404,6 +3408,7 @@ export function SettingsDialog({
                                         skipInitialRefresh
                                         signInLabel={t('settings.amrAuthorize')}
                                         showConsoleAction={amrCardStatus?.loggedIn === true}
+                                        amrEntrySourceDetail="settings_amr_authorize"
                                         revealPendingCancelAction={amrRevealPendingCancelAction}
                                         onStatusChange={setAmrCardStatus}
                                       />

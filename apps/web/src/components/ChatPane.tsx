@@ -1,12 +1,25 @@
-import { Fragment, useEffect, useRef, useState, type MutableRefObject, type ReactNode } from 'react';
+import {
+  Fragment,
+  memo,
+  useCallback,
+  useDeferredValue,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type DragEvent as ReactDragEvent,
+  type MutableRefObject,
+  type ReactNode,
+} from 'react';
 import { useAnalytics } from '../analytics/provider';
-import { trackChatPanelClick } from '../analytics/events';
+import { trackChatPanelClick, trackRunFailedToastSurfaceView } from '../analytics/events';
+import { attributedAmrUrl, recordAmrEntry } from '../analytics/amr-attribution';
 import { useT } from '../i18n';
 import type { Dict } from '../i18n/types';
 import { copyToClipboard } from '../lib/copy-to-clipboard';
 import { projectRawUrl } from '../providers/registry';
 import type { TodoItem } from '../runtime/todos';
-import type { AppliedPluginSnapshot } from '@open-design/contracts';
+import type { AppliedPluginSnapshot, ChatSessionMode, WorkspaceContextItem } from '@open-design/contracts';
 import type { TrackingProjectKind } from '@open-design/contracts/analytics';
 import {
   DESIGN_SYSTEM_WORKSPACE_DISPLAY_DESCRIPTION,
@@ -27,7 +40,7 @@ import {
   type ChatSendMeta,
 } from './ChatComposer';
 import type { PluginFolderAgentAction } from './design-files/pluginFolderActions';
-import { Icon } from './Icon';
+import { Icon, type IconName } from './Icon';
 import { repoConnectCopy } from './design-system-github-evidence';
 import type { SettingsSection } from './SettingsDialog';
 
@@ -213,8 +226,11 @@ function pickStarters(
 interface Props {
   messages: ChatMessage[];
   streaming: boolean;
+  loading?: boolean;
   error: string | null;
   projectId: string | null;
+  sessionMode?: ChatSessionMode;
+  onSessionModeChange?: (mode: ChatSessionMode) => void;
   // Analytics-only — forwarded to AssistantMessage so the feedback
   // events know which project surface the rating applies to. Optional
   // (defaults to null/'prototype') so unit tests can mount ChatPane
@@ -226,7 +242,8 @@ interface Props {
   sendDisabled?: boolean;
   queuedItems?: QueuedSendItem[];
   onRemoveQueuedSend?: (id: string) => void;
-  onUpdateQueuedSend?: (id: string, prompt: string) => void;
+  onUpdateQueuedSend?: (id: string, update: QueuedSendUpdate) => void;
+  onReorderQueuedSends?: (orderedIds: string[]) => void;
   onSendQueuedNow?: (id: string) => void;
   // Names that exist in the project folder. Tool cards and chips use this
   // set to decide whether a path can be opened as a tab.
@@ -252,6 +269,8 @@ interface Props {
   // FileWorkspace's openRequest. Tool cards, attachment chips, and
   // produced-file chips all call this.
   onRequestOpenFile?: (name: string) => void;
+  onRequestPluginDetails?: (pluginId: string) => void;
+  onRequestDesignSystemDetails?: (system: DesignSystemSummary) => void;
   onRequestPluginFolderAgentAction?: (
     relativePath: string,
     action: PluginFolderAgentAction,
@@ -267,6 +286,8 @@ interface Props {
   onOpenQuestions?: () => void;
   onContinueRemainingTasks?: (assistantMessage: ChatMessage, todos: TodoItem[]) => void;
   onAssistantFeedback?: (assistantMessage: ChatMessage, change: ChatMessageFeedbackChange) => void;
+  onForkFromMessage?: (assistantMessage: ChatMessage) => void;
+  forkingMessageId?: string | null;
   // Header "+" button — kicks off ProjectView's create-conversation flow.
   onNewConversation?: () => void;
   newConversationDisabled?: boolean;
@@ -313,6 +334,8 @@ interface Props {
   onOpenPetSettings?: () => void;
   projectMetadata?: ProjectMetadata;
   onProjectMetadataChange?: (metadata: ProjectMetadata) => void;
+  activeWorkspaceContext?: WorkspaceContextItem | null;
+  workspaceContexts?: WorkspaceContextItem[];
   currentSkillId?: string | null;
   onProjectSkillChange?: (skillId: string | null) => void;
   researchAvailable?: boolean;
@@ -353,20 +376,41 @@ interface Props {
 
 type Tab = 'chat' | 'comments';
 
+const CHAT_MESSAGE_VIRTUALIZE_THRESHOLD = 80;
+const CHAT_MESSAGE_OVERSCAN_PX = 900;
+const CHAT_VIRTUAL_ROW_GAP_PX = 14;
+const CHAT_VIRTUAL_MIN_ROW_HEIGHT = 36;
+const CHAT_VIRTUAL_DEFAULT_VIEWPORT_PX = 640;
+const CHAT_VIRTUAL_INITIAL_TAIL_ROWS = 16;
+const CONVERSATION_ROW_HEIGHT_PX = 34;
+const CONVERSATION_VIRTUALIZE_THRESHOLD = 36;
+const CONVERSATION_OVERSCAN_ROWS = 8;
+
 interface QueuedSendItem {
   id: string;
   prompt: string;
   attachments?: ChatAttachment[];
   commentAttachments?: ChatCommentAttachment[];
+  meta?: ChatSendMeta;
+}
+
+interface QueuedSendUpdate {
+  prompt: string;
+  attachments: ChatAttachment[];
+  commentAttachments: ChatCommentAttachment[];
+  meta?: ChatSendMeta;
 }
 
 export function ChatPane({
   messages,
   streaming,
+  loading = false,
   sendDisabled = false,
   queuedItems = [],
   error,
   projectId,
+  sessionMode = 'design',
+  onSessionModeChange,
   projectKindForTracking = null,
   projectFiles,
   hasActiveDesignSystem = false,
@@ -383,8 +427,11 @@ export function ChatPane({
   onStop,
   onRemoveQueuedSend,
   onUpdateQueuedSend,
+  onReorderQueuedSends,
   onSendQueuedNow,
   onRequestOpenFile,
+  onRequestPluginDetails,
+  onRequestDesignSystemDetails,
   onRequestPluginFolderAgentAction,
   activePluginActionPaths,
   hiddenPluginActionPaths,
@@ -394,6 +441,8 @@ export function ChatPane({
   onOpenQuestions,
   onContinueRemainingTasks,
   onAssistantFeedback,
+  onForkFromMessage,
+  forkingMessageId = null,
   onNewConversation,
   newConversationDisabled = false,
   conversations,
@@ -415,6 +464,8 @@ export function ChatPane({
   onOpenPetSettings,
   projectMetadata,
   onProjectMetadataChange,
+  activeWorkspaceContext,
+  workspaceContexts = [],
   currentSkillId = null,
   onProjectSkillChange,
   researchAvailable,
@@ -441,11 +492,13 @@ export function ChatPane({
   const t = useT();
   const analytics = useAnalytics();
   const logRef = useRef<HTMLDivElement | null>(null);
+  const chatLogScrollIdleTimerRef = useRef<number | null>(null);
   const historyWrapRef = useRef<HTMLDivElement | null>(null);
   const composerRef = useRef<ChatComposerHandle | null>(null);
   const pinnedTodoRef = useRef<HTMLDivElement | null>(null);
   const queuedSendStripRef = useRef<HTMLDivElement | null>(null);
   const didInitialScrollRef = useRef(false);
+  const runFailedToastSurfaceKeysRef = useRef<Set<string>>(new Set());
   // Tracks whether the user is glued close enough to the bottom that
   // streamed content should auto-follow. Distinct from the jump-button
   // state below, which uses a wider threshold (120px) so the affordance
@@ -454,16 +507,37 @@ export function ChatPane({
   // shouldn't be yanked back the moment the next chunk streams in.
   const pinnedToBottomRef = useRef(true);
   const scrolledToFormRef = useRef<Set<string>>(new Set());
+  // AssistantMessage's four interaction callbacks are re-created per render and
+  // excluded from its memo comparison (so streaming doesn't re-render every
+  // message). Route them through this ref so a memoized message still calls the
+  // LATEST handler. See areAssistantMessagePropsEqual in AssistantMessage.tsx.
+  const assistantCallbacksRef = useRef({
+    onSubmitForm,
+    onContinueRemainingTasks,
+    onAssistantFeedback,
+    onForkFromMessage,
+  });
+  assistantCallbacksRef.current = {
+    onSubmitForm,
+    onContinueRemainingTasks,
+    onAssistantFeedback,
+    onForkFromMessage,
+  };
   const [tab, setTab] = useState<Tab>('chat');
   const [showConvList, setShowConvList] = useState(false);
+  const [conversationSearch, setConversationSearch] = useState('');
+  const deferredConversationSearch = useDeferredValue(conversationSearch);
   const [scrolledFromBottom, setScrolledFromBottom] = useState(false);
+  const [chatLogScrollable, setChatLogScrollable] = useState(false);
+  const [chatLogScrolling, setChatLogScrolling] = useState(false);
   // The user can dismiss the pinned task list once everything is complete.
   // We key the dismissal on the snapshot (serialized TodoWrite input) so
   // the next time the agent emits a different snapshot the card returns,
   // but the same snapshot stays hidden across renders / streaming ticks.
   // Persisted to sessionStorage so the dismissal survives tab switches and
   // component remounts (the ChatPane key includes conversationId, so switching
-  // conversations unmounts and remounts the component).
+  // conversations unmounts and remounts the component). The stored value is the
+  // snapshot key, so a fresh TodoWrite snapshot still re-shows the card.
   const dismissedStorageKey = `dismissedTodo:${activeConversationId ?? 'none'}`;
   const [dismissedPinnedTodoKey, setDismissedPinnedTodoKey] = useState<string | null>(() => {
     try {
@@ -472,7 +546,6 @@ export function ChatPane({
       return null;
     }
   });
-  
   // Sync dismissed state when conversationId changes (e.g., tab switching).
   // The parent key includes conversationId so unmount/remount resets this,
   // but if conversationId changes without unmounting or the storage key
@@ -485,7 +558,15 @@ export function ChatPane({
       // sessionStorage access can fail in private browsing
     }
   }, [dismissedStorageKey]);
-  const lastAssistantId = [...messages].reverse().find((m) => m.role === 'assistant')?.id;
+  const [editingQueuedSendId, setEditingQueuedSendId] = useState<string | null>(null);
+  // Reverse scan (no array copy) + memo so this and the maps below don't
+  // recompute on every non-`messages` render (scroll, hover, toggles).
+  const lastAssistantId = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i]!.role === 'assistant') return messages[i]!.id;
+    }
+    return undefined;
+  }, [messages]);
   const hasActiveRunMessage = messages.some(
     (m) => m.role === 'assistant' && isActiveRunStatus(m.runStatus),
   );
@@ -532,17 +613,59 @@ export function ChatPane({
           runId: retryAssistant.runId ?? null,
         }
       : null;
+  useEffect(() => {
+    if (!displayError || !failedRunErrorEvent?.code || !retryAssistant) return;
+    // The hosted-AMR nudge owns this same surface_view when it renders below
+    // the error card. For all other failed-run guidance (AMR auth/balance,
+    // Antigravity auth/quota, upstream outage, generic retry), the chat error
+    // card itself is the visible run_failed_toast surface.
+    if (amrSwitchPayload) return;
+
+    const key = [
+      projectId ?? '',
+      activeConversationId ?? '',
+      retryAssistant.id,
+      retryAssistant.runId ?? '',
+      failedRunErrorEvent.code,
+    ].join(':');
+    if (runFailedToastSurfaceKeysRef.current.has(key)) return;
+    runFailedToastSurfaceKeysRef.current.add(key);
+
+    trackRunFailedToastSurfaceView(analytics.track, {
+      page_name: 'chat_panel',
+      area: 'chat_panel',
+      element: 'run_failed_toast',
+      error_code: failedRunErrorEvent.code,
+      project_id: projectId ?? '',
+      project_kind: projectKindForTracking,
+      conversation_id: activeConversationId,
+      assistant_message_id: retryAssistant.id,
+      run_id: retryAssistant.runId ?? null,
+    });
+  }, [
+    activeConversationId,
+    analytics.track,
+    amrSwitchPayload,
+    displayError,
+    failedRunErrorEvent?.code,
+    projectId,
+    projectKindForTracking,
+    retryAssistant,
+  ]);
   const composerDraftStorageKey = projectId && activeConversationId
     ? `od:chat-composer:draft:${projectId}:${activeConversationId}`
     : undefined;
   // Only the first user message gets the active-plugin chip — the
   // plugin is project-scoped so re-stamping it on every reply would be
   // noise. Subsequent messages still run under the same snapshot.
-  const firstUserMessageId = messages.find((m) => m.role === 'user')?.id;
+  const firstUserMessageId = useMemo(
+    () => messages.find((m) => m.role === 'user')?.id,
+    [messages],
+  );
   // Map each assistant message id to the user message that follows it
   // (if any) so QuestionFormView can render its locked "answered" state
   // with the user's picks.
-  const nextUserContentByAssistantId = (() => {
+  const nextUserContentByAssistantId = useMemo(() => {
     const map = new Map<string, string>();
     for (let i = 0; i < messages.length - 1; i++) {
       const m = messages[i]!;
@@ -552,7 +675,7 @@ export function ChatPane({
       }
     }
     return map;
-  })();
+  }, [messages]);
 
   useEffect(() => {
     didInitialScrollRef.current = false;
@@ -589,6 +712,22 @@ export function ChatPane({
     lastDraftSignalNonceRef.current = composerDraftSignal.nonce;
     composerRef.current?.setDraft(composerDraftSignal.text);
   }, [composerDraftSignal]);
+
+  useEffect(() => {
+    if (!editingQueuedSendId) return;
+    if (queuedItems.some((item) => item.id === editingQueuedSendId)) return;
+    setEditingQueuedSendId(null);
+  }, [editingQueuedSendId, queuedItems]);
+
+  const restoreQueuedSendToComposer = (item: QueuedSendItem) => {
+    setEditingQueuedSendId(item.id);
+    composerRef.current?.restoreDraft({
+      text: item.prompt,
+      attachments: item.attachments ?? [],
+      commentAttachments: item.commentAttachments ?? [],
+      meta: item.meta,
+    });
+  };
 
   useEffect(() => {
     const el = logRef.current;
@@ -683,6 +822,23 @@ export function ChatPane({
     const el = logRef.current;
     if (!el) return;
 
+    function syncScrollable(target: HTMLDivElement) {
+      const next = target.scrollHeight - target.clientHeight > 1;
+      setChatLogScrollable((prev) => (prev === next ? prev : next));
+      if (!next) setChatLogScrolling(false);
+    }
+
+    function markScrolling() {
+      setChatLogScrolling(true);
+      if (chatLogScrollIdleTimerRef.current !== null) {
+        window.clearTimeout(chatLogScrollIdleTimerRef.current);
+      }
+      chatLogScrollIdleTimerRef.current = window.setTimeout(() => {
+        chatLogScrollIdleTimerRef.current = null;
+        setChatLogScrolling(false);
+      }, 650);
+    }
+
     // Restore previously-saved position on remount. Defer to the next
     // frame so the conditional <> contents finish layout before the
     // scrollTop write lands.
@@ -696,6 +852,7 @@ export function ChatPane({
         } else {
           target.scrollTop = saved.scrollTop;
         }
+        syncScrollable(target);
         // Resync the jump-to-latest affordance with the restored
         // position. Without this, a user who left Chat ~60px from the
         // bottom and returns to find new messages stacked underneath
@@ -720,6 +877,8 @@ export function ChatPane({
     function onScroll() {
       const target = logRef.current;
       if (!target) return;
+      syncScrollable(target);
+      markScrolling();
       snapshot(target);
       const distance =
         target.scrollHeight - target.scrollTop - target.clientHeight;
@@ -731,6 +890,7 @@ export function ChatPane({
       setScrolledFromBottom((prev) => (prev === next ? prev : next));
       pinnedToBottomRef.current = distance < 80;
     }
+    syncScrollable(el);
     el.addEventListener('scroll', onScroll);
     return () => {
       // Capture final scroll state before unmount; the ref normally
@@ -738,6 +898,11 @@ export function ChatPane({
       // right before unmount can leave it stale.
       snapshot(el);
       el.removeEventListener('scroll', onScroll);
+      if (chatLogScrollIdleTimerRef.current !== null) {
+        window.clearTimeout(chatLogScrollIdleTimerRef.current);
+        chatLogScrollIdleTimerRef.current = null;
+      }
+      setChatLogScrolling(false);
     };
   }, [tab]);
 
@@ -760,7 +925,15 @@ export function ChatPane({
 
     const resizeObserver =
       typeof ResizeObserver !== 'undefined'
-        ? new ResizeObserver(followLatestIfPinned)
+        ? new ResizeObserver(() => {
+            const target = logRef.current;
+            if (target) {
+              const next = target.scrollHeight - target.clientHeight > 1;
+              setChatLogScrollable((prev) => (prev === next ? prev : next));
+              if (!next) setChatLogScrolling(false);
+            }
+            followLatestIfPinned();
+          })
         : null;
     const observedChildren = new Set<Element>();
     const syncObservedChildren = () => {
@@ -824,10 +997,13 @@ export function ChatPane({
             followLatestIfPinned();
           })
         : null;
+    // childList + subtree only — NOT characterData. Auto-follow during
+    // streaming is driven by the ResizeObserver on each message child (text
+    // growth changes height), so observing per-character text mutations would
+    // re-run the full sync sweep on every streamed frame for no extra benefit.
     mutationObserver?.observe(el, {
       childList: true,
       subtree: true,
-      characterData: true,
     });
     // PinnedTodoSlot and QueuedSendStrip live outside the chat-log subtree
     // (they are siblings of .chat-log-wrap inside .pane). The
@@ -865,8 +1041,17 @@ export function ChatPane({
     };
   }, [showConvList]);
 
+  useEffect(() => {
+    if (showConvList) return;
+    setConversationSearch('');
+  }, [showConvList]);
+
   const activeConversation =
     conversations.find((c) => c.id === activeConversationId) ?? null;
+  const filteredConversations = useMemo(
+    () => filterConversations(conversations, deferredConversationSearch, t),
+    [conversations, deferredConversationSearch, t],
+  );
 
   function jumpToBottom() {
     const el = logRef.current;
@@ -929,6 +1114,11 @@ export function ChatPane({
                 <span className="chat-history-menu-title">
                   {t('chat.conversationsHeading')}
                 </span>
+                <span className="chat-history-menu-count">
+                  {filteredConversations.length === conversations.length
+                    ? compactCount(conversations.length)
+                    : `${compactCount(filteredConversations.length)} / ${compactCount(conversations.length)}`}
+                </span>
                 {onNewConversation ? (
                   <button
                     type="button"
@@ -951,17 +1141,42 @@ export function ChatPane({
                   </button>
                 ) : null}
               </div>
+              <label className="chat-history-search">
+                <Icon name="search" size={12} />
+                <input
+                  type="search"
+                  value={conversationSearch}
+                  onChange={(event) => setConversationSearch(event.currentTarget.value)}
+                  placeholder="Search conversations"
+                  data-testid="conversation-history-search"
+                />
+                {conversationSearch ? (
+                  <button
+                    type="button"
+                    className="chat-history-search-clear"
+                    onClick={() => setConversationSearch('')}
+                    aria-label={t('chat.comments.clear')}
+                  >
+                    <Icon name="close" size={10} />
+                  </button>
+                ) : null}
+              </label>
               <div className="chat-history-list" data-testid="conversation-list">
                 {conversations.length === 0 ? (
                   <div className="chat-history-empty">
                     {t('chat.emptyConversations')}
                   </div>
+                ) : filteredConversations.length === 0 ? (
+                  <div className="chat-history-empty">
+                    No conversations match.
+                  </div>
                 ) : (
-                  conversations.map((c) => (
+                  filteredConversations.map((c) => (
                     <ConversationRow
                       key={c.id}
                       conversation={c}
                       active={c.id === activeConversationId}
+                      messageCount={conversationMessageCount(c, activeConversationId, messages.length)}
                       onSelect={() => {
                         onSelectConversation(c.id);
                         setShowConvList(false);
@@ -979,8 +1194,18 @@ export function ChatPane({
       {tab === 'chat' ? (
         <>
           <div className="chat-log-wrap">
-            <div className="chat-log" ref={logRef}>
-              {messages.length === 0 ? (
+            <div
+              className={[
+                'chat-log',
+                loading ? 'is-loading' : '',
+                chatLogScrollable ? 'is-scrollable' : '',
+                chatLogScrolling ? 'is-scrolling' : '',
+              ].filter(Boolean).join(' ')}
+              ref={logRef}
+              aria-busy={loading}
+            >
+              {loading ? <ChatConversationLoading t={t} /> : null}
+              {messages.length === 0 && !loading ? (
                 <div className="chat-empty-wrap">
                   <div className="chat-empty">
                     <span className="chat-empty-title">
@@ -1047,74 +1272,42 @@ export function ChatPane({
                   ) : null}
                 </div>
               ) : null}
-              {messages.map((m, i) => {
-                const showDaySeparator = shouldShowDaySeparator(messages[i - 1], m);
-                const messageStreaming = isAssistantMessageStreaming(
-                  m,
-                  streaming,
-                  lastAssistantId,
-                  forceStreamingMessageIds,
-                );
-                return (
-                  <Fragment key={m.id}>
-                    {showDaySeparator ? <DaySeparator ts={messageTime(m)} /> : null}
-                    {m.role === 'user' ? (
-                      <UserMessage
-                        message={m}
-                        projectId={projectId}
-                        projectFileNames={projectFileNames}
-                        onRequestOpenFile={onRequestOpenFile}
-                        t={t}
-                        activePluginSnapshot={
-                          m.id === firstUserMessageId
-                            ? activePluginSnapshot ?? null
-                            : null
-                        }
-                        activeDesignSystem={
-                          m.id === firstUserMessageId
-                            ? activeDesignSystem ?? null
-                            : null
-                        }
-                      />
-                    ) : (
-                      <AssistantMessage
-                        message={m}
-                        streaming={messageStreaming}
-                        projectId={projectId}
-                        projectKind={projectKindForTracking}
-                        conversationId={activeConversationId}
-                        projectFiles={projectFiles}
-                        projectFileNames={projectFileNames}
-                        onRequestOpenFile={onRequestOpenFile}
-                        onRequestPluginFolderAgentAction={onRequestPluginFolderAgentAction}
-                        activePluginActionPaths={activePluginActionPaths}
-                        hiddenPluginActionPaths={hiddenPluginActionPaths}
-                        isLast={m.id === lastAssistantId}
-                        errorCardOwnerId={errorCardOwnerId}
-                        nextUserContent={nextUserContentByAssistantId.get(m.id)}
-                        suppressDirectionForms={hasActiveDesignSystem}
-                        hasDesignSystemContext={hasActiveDesignSystem || !!activeDesignSystem}
-                        onSubmitForm={(text) => {
-                          pinnedToBottomRef.current = true;
-                          scrolledToFormRef.current = new Set();
-                          onSubmitForm?.(text);
-                        }}
-                        onOpenQuestions={onOpenQuestions}
-                        onContinueRemainingTasks={
-                          m.id === lastAssistantId && onContinueRemainingTasks
-                            ? (todos) => onContinueRemainingTasks(m, todos)
-                            : undefined
-                        }
-                        onFeedback={
-                          onAssistantFeedback
-                            ? (rating) => onAssistantFeedback(m, rating)
-                            : undefined
-                        }
-                      />
-                    )}
-                  </Fragment>
-                );
-              })}
+              <ChatRows
+                messages={messages}
+                streaming={streaming}
+                projectId={projectId}
+                projectKindForTracking={projectKindForTracking}
+                activeConversationId={activeConversationId}
+                activeConversationKey={activeConversationId ?? 'no-conversation'}
+                projectFiles={projectFiles}
+                projectFileNames={projectFileNames}
+                onRequestOpenFile={onRequestOpenFile}
+                onRequestPluginDetails={onRequestPluginDetails}
+                onRequestDesignSystemDetails={onRequestDesignSystemDetails}
+                onRequestPluginFolderAgentAction={onRequestPluginFolderAgentAction}
+                activePluginActionPaths={activePluginActionPaths}
+                hiddenPluginActionPaths={hiddenPluginActionPaths}
+                forceStreamingMessageIds={forceStreamingMessageIds}
+                lastAssistantId={lastAssistantId}
+                firstUserMessageId={firstUserMessageId}
+                activePluginSnapshot={activePluginSnapshot}
+                activeDesignSystem={activeDesignSystem}
+                hasActiveDesignSystem={hasActiveDesignSystem}
+                errorCardOwnerId={errorCardOwnerId}
+                nextUserContentByAssistantId={nextUserContentByAssistantId}
+                assistantCallbacksRef={assistantCallbacksRef}
+                onContinueRemainingTasks={onContinueRemainingTasks}
+                onForkFromMessage={onForkFromMessage}
+                onAssistantFeedback={onAssistantFeedback}
+                forkingMessageId={forkingMessageId}
+                t={t}
+                onAssistantFormSubmitStart={() => {
+                  pinnedToBottomRef.current = true;
+                  scrolledToFormRef.current = new Set();
+                }}
+                onOpenQuestions={onOpenQuestions}
+                scrollContainerRef={logRef}
+              />
               {displayError ? (
                 <div className="msg error">
                   <span className="chat-error-text">{displayError}</span>
@@ -1125,6 +1318,7 @@ export function ChatPane({
                           type="button"
                           className="chat-error-action"
                           onClick={() => {
+                            recordAmrEntry(analytics.track, 'chat_error_authorize_retry');
                             if (onSwitchToAmrAndRetry) {
                               onSwitchToAmrAndRetry(retryAssistant);
                             } else {
@@ -1158,9 +1352,17 @@ export function ChatPane({
                         <button
                           type="button"
                           className="chat-error-action"
-                          onClick={() =>
-                            window.open(AMR_RECHARGE_URL, '_blank', 'noopener,noreferrer')
-                          }
+                          onClick={() => {
+                            const attribution = recordAmrEntry(
+                              analytics.track,
+                              'chat_error_recharge',
+                            );
+                            window.open(
+                              attributedAmrUrl(AMR_RECHARGE_URL, attribution),
+                              '_blank',
+                              'noopener,noreferrer',
+                            );
+                          }}
                         >
                           {t('chat.amrError.rechargeCta')}
                         </button>
@@ -1181,6 +1383,7 @@ export function ChatPane({
               {amrSwitchPayload ? (
                 <AmrGuidance
                   {...amrSwitchPayload}
+                  sourceDetail="chat_error_switch_retry_card"
                   onActivate={() => {
                     if (retryAssistant && onSwitchToAmrAndRetry) {
                       onSwitchToAmrAndRetry(retryAssistant);
@@ -1228,8 +1431,10 @@ export function ChatPane({
           <QueuedSendStrip
             containerRef={queuedSendStripRef}
             items={queuedItems}
+            editingId={editingQueuedSendId}
+            onEdit={restoreQueuedSendToComposer}
             onRemove={onRemoveQueuedSend}
-            onUpdate={onUpdateQueuedSend}
+            onReorder={onReorderQueuedSends}
             onSendNow={onSendQueuedNow}
           />
           <ChatComposer
@@ -1237,6 +1442,8 @@ export function ChatPane({
             designSystemPicker={designSystemPicker}
             projectId={projectId}
             projectFiles={projectFiles}
+            sessionMode={sessionMode}
+            onSessionModeChange={onSessionModeChange}
             skills={skills}
             streaming={streaming}
             sendDisabled={sendDisabled}
@@ -1248,6 +1455,19 @@ export function ChatPane({
             onSend={(prompt, attachments, commentAttachments, meta) => {
               pinnedToBottomRef.current = true;
               scrolledToFormRef.current = new Set();
+              if (editingQueuedSendId && onUpdateQueuedSend) {
+                const original = queuedItems.find((item) => item.id === editingQueuedSendId);
+                const update: QueuedSendUpdate = {
+                  prompt,
+                  attachments,
+                  commentAttachments,
+                };
+                const nextMeta = meta ?? original?.meta;
+                if (nextMeta !== undefined) update.meta = nextMeta;
+                onUpdateQueuedSend(editingQueuedSendId, update);
+                setEditingQueuedSendId(null);
+                return;
+              }
               onSend(prompt, attachments, commentAttachments, meta);
             }}
             onStop={onStop}
@@ -1260,6 +1480,8 @@ export function ChatPane({
             researchAvailable={researchAvailable}
             projectMetadata={projectMetadata}
             onProjectMetadataChange={onProjectMetadataChange}
+            activeWorkspaceContext={activeWorkspaceContext}
+            workspaceContexts={workspaceContexts}
             byokApiProtocol={byokApiProtocol}
             byokImageModel={byokImageModel}
             onChangeByokImageModel={onChangeByokImageModel}
@@ -1281,6 +1503,445 @@ export function ChatPane({
       ) : null}
     </div>
   );
+}
+
+interface AssistantCallbacks {
+  onSubmitForm: ((text: string) => void) | undefined;
+  onContinueRemainingTasks:
+    | ((assistantMessage: ChatMessage, todos: TodoItem[]) => void)
+    | undefined;
+  onAssistantFeedback:
+    | ((message: ChatMessage, change: ChatMessageFeedbackChange) => void)
+    | undefined;
+  onForkFromMessage: ((message: ChatMessage) => void) | undefined;
+}
+
+type ChatRenderItem =
+  | {
+      kind: 'separator';
+      key: string;
+      timestamp: number;
+    }
+  | {
+      kind: 'message';
+      key: string;
+      message: ChatMessage;
+    };
+
+function ChatConversationLoading({ t }: { t: TranslateFn }) {
+  return (
+    <div className="chat-loading-state" role="status" aria-live="polite">
+      <span className="chat-loading-mark" aria-hidden>
+        <span />
+        <span />
+        <span />
+      </span>
+      <span className="chat-loading-copy">{t('common.loading')}</span>
+      <span className="chat-loading-lines" aria-hidden>
+        <span />
+        <span />
+        <span />
+      </span>
+    </div>
+  );
+}
+
+function ChatRows({
+  messages,
+  streaming,
+  projectId,
+  projectKindForTracking,
+  activeConversationId,
+  activeConversationKey,
+  projectFiles,
+  projectFileNames,
+  onRequestOpenFile,
+  onRequestPluginDetails,
+  onRequestDesignSystemDetails,
+  onRequestPluginFolderAgentAction,
+  activePluginActionPaths,
+  hiddenPluginActionPaths,
+  forceStreamingMessageIds,
+  lastAssistantId,
+  firstUserMessageId,
+  activePluginSnapshot,
+  activeDesignSystem,
+  hasActiveDesignSystem,
+  errorCardOwnerId,
+  nextUserContentByAssistantId,
+  assistantCallbacksRef,
+  onContinueRemainingTasks,
+  onForkFromMessage,
+  onAssistantFeedback,
+  forkingMessageId,
+  t,
+  onAssistantFormSubmitStart,
+  onOpenQuestions,
+  scrollContainerRef,
+}: {
+  messages: ChatMessage[];
+  streaming: boolean;
+  projectId: string | null;
+  projectKindForTracking: TrackingProjectKind | null;
+  activeConversationId: string | null;
+  activeConversationKey: string;
+  projectFiles: ProjectFile[];
+  projectFileNames?: Set<string>;
+  onRequestOpenFile?: (name: string) => void;
+  onRequestPluginDetails?: (pluginId: string) => void;
+  onRequestDesignSystemDetails?: (system: DesignSystemSummary) => void;
+  onRequestPluginFolderAgentAction?: (relativePath: string, action: PluginFolderAgentAction) => void;
+  activePluginActionPaths?: Set<string>;
+  hiddenPluginActionPaths?: Set<string>;
+  forceStreamingMessageIds?: Set<string>;
+  lastAssistantId: string | undefined;
+  firstUserMessageId: string | undefined;
+  activePluginSnapshot?: AppliedPluginSnapshot | null;
+  activeDesignSystem?: DesignSystemSummary | null;
+  hasActiveDesignSystem: boolean;
+  errorCardOwnerId: string | null;
+  nextUserContentByAssistantId: Map<string, string>;
+  assistantCallbacksRef: MutableRefObject<AssistantCallbacks>;
+  onContinueRemainingTasks?: (assistantMessage: ChatMessage, todos: TodoItem[]) => void;
+  onForkFromMessage?: (message: ChatMessage) => void;
+  onAssistantFeedback?: (message: ChatMessage, change: ChatMessageFeedbackChange) => void;
+  forkingMessageId?: string | null;
+  t: TranslateFn;
+  onAssistantFormSubmitStart: () => void;
+  onOpenQuestions?: () => void;
+  scrollContainerRef: MutableRefObject<HTMLDivElement | null>;
+}) {
+  const items = useMemo(() => buildChatRenderItems(messages), [messages]);
+  const virtualized = items.length > CHAT_MESSAGE_VIRTUALIZE_THRESHOLD;
+  const virtualWindow = useMeasuredVirtualWindow(items, {
+    enabled: virtualized,
+    containerRef: scrollContainerRef,
+    estimateSize: estimateChatRenderItemHeight,
+    overscanPx: CHAT_MESSAGE_OVERSCAN_PX,
+    resetKey: activeConversationKey,
+    initialTailRows: CHAT_VIRTUAL_INITIAL_TAIL_ROWS,
+  });
+
+  const renderItem = (item: ChatRenderItem) => {
+    if (item.kind === 'separator') {
+      return <DaySeparator ts={item.timestamp} />;
+    }
+    const m = item.message;
+    const messageStreaming = isAssistantMessageStreaming(
+      m,
+      streaming,
+      lastAssistantId,
+      forceStreamingMessageIds,
+    );
+    if (m.role === 'user') {
+      return (
+        <UserMessage
+          message={m}
+          projectId={projectId}
+          projectFileNames={projectFileNames}
+          onRequestOpenFile={onRequestOpenFile}
+          onRequestPluginDetails={onRequestPluginDetails}
+          onRequestDesignSystemDetails={onRequestDesignSystemDetails}
+          t={t}
+          activePluginSnapshot={
+            m.id === firstUserMessageId
+              ? activePluginSnapshot ?? null
+              : null
+          }
+          activeDesignSystem={
+            m.id === firstUserMessageId
+              ? activeDesignSystem ?? null
+              : null
+          }
+        />
+      );
+    }
+    return (
+      <AssistantMessage
+        message={m}
+        streaming={messageStreaming}
+        projectId={projectId}
+        projectKind={projectKindForTracking}
+        conversationId={activeConversationId}
+        projectFiles={projectFiles}
+        projectFileNames={projectFileNames}
+        onRequestOpenFile={onRequestOpenFile}
+        onRequestPluginFolderAgentAction={onRequestPluginFolderAgentAction}
+        activePluginActionPaths={activePluginActionPaths}
+        hiddenPluginActionPaths={hiddenPluginActionPaths}
+        isLast={m.id === lastAssistantId}
+        errorCardOwnerId={errorCardOwnerId}
+        nextUserContent={nextUserContentByAssistantId.get(m.id)}
+        suppressDirectionForms={hasActiveDesignSystem}
+        hasDesignSystemContext={hasActiveDesignSystem || !!activeDesignSystem}
+        onSubmitForm={(text) => {
+          onAssistantFormSubmitStart();
+          assistantCallbacksRef.current.onSubmitForm?.(text);
+        }}
+        onOpenQuestions={onOpenQuestions}
+        onContinueRemainingTasks={
+          m.id === lastAssistantId && onContinueRemainingTasks
+            ? (todos) => assistantCallbacksRef.current.onContinueRemainingTasks?.(m, todos)
+            : undefined
+        }
+        onForkFromMessage={
+          onForkFromMessage
+            ? () => assistantCallbacksRef.current.onForkFromMessage?.(m)
+            : undefined
+        }
+        forking={forkingMessageId === m.id}
+        onFeedback={
+          onAssistantFeedback
+            ? (rating) => assistantCallbacksRef.current.onAssistantFeedback?.(m, rating)
+            : undefined
+        }
+      />
+    );
+  };
+
+  if (items.length === 0) return null;
+
+  if (!virtualized) {
+    return (
+      <>
+        {items.map((item) => (
+          <Fragment key={item.key}>{renderItem(item)}</Fragment>
+        ))}
+      </>
+    );
+  }
+
+  return (
+    <div
+      className="chat-virtual-spacer"
+      data-testid="chat-virtual-spacer"
+      style={{ height: virtualWindow.totalHeight }}
+    >
+      {virtualWindow.rows.map((row) => (
+        <VirtualChatRow
+          key={row.item.key}
+          itemKey={row.item.key}
+          top={row.top}
+          onMeasure={virtualWindow.onMeasure}
+        >
+          {renderItem(row.item)}
+        </VirtualChatRow>
+      ))}
+    </div>
+  );
+}
+
+function VirtualChatRow({
+  itemKey,
+  top,
+  onMeasure,
+  children,
+}: {
+  itemKey: string;
+  top: number;
+  onMeasure: (key: string, height: number) => void;
+  children: ReactNode;
+}) {
+  const rowRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const node = rowRef.current;
+    if (!node) return;
+    const measure = () => {
+      const height = node.getBoundingClientRect().height;
+      onMeasure(itemKey, height);
+    };
+    measure();
+    if (typeof ResizeObserver === 'undefined') return undefined;
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [itemKey, onMeasure]);
+
+  return (
+    <div
+      ref={rowRef}
+      className="chat-virtual-row"
+      style={{ transform: `translateY(${top}px)` }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function buildChatRenderItems(messages: ChatMessage[]): ChatRenderItem[] {
+  const items: ChatRenderItem[] = [];
+  for (let i = 0; i < messages.length; i += 1) {
+    const message = messages[i]!;
+    if (shouldShowDaySeparator(messages[i - 1], message)) {
+      const timestamp = messageTime(message);
+      if (timestamp === undefined) continue;
+      items.push({
+        kind: 'separator',
+        key: `day:${dayKey(timestamp)}:${message.id}`,
+        timestamp,
+      });
+    }
+    items.push({
+      kind: 'message',
+      key: `message:${message.id}`,
+      message,
+    });
+  }
+  return items;
+}
+
+function estimateChatRenderItemHeight(item: ChatRenderItem): number {
+  if (item.kind === 'separator') return 34 + CHAT_VIRTUAL_ROW_GAP_PX;
+  const message = item.message;
+  const contentLength = message.content?.length ?? 0;
+  const attachmentCount = (message.attachments?.length ?? 0) + (message.commentAttachments?.length ?? 0);
+  const eventCount = message.events?.length ?? 0;
+  const fileCount = message.producedFiles?.length ?? 0;
+  const base = message.role === 'user' ? 82 : 118;
+  const contentRows = Math.min(18, Math.ceil(contentLength / 120));
+  return (
+    base
+    + contentRows * 18
+    + attachmentCount * 34
+    + eventCount * 28
+    + fileCount * 32
+    + CHAT_VIRTUAL_ROW_GAP_PX
+  );
+}
+
+function useMeasuredVirtualWindow<T extends { key: string }>(
+  items: T[],
+  {
+    enabled,
+    containerRef,
+    estimateSize,
+    overscanPx,
+    resetKey,
+    initialTailRows,
+  }: {
+    enabled: boolean;
+    containerRef: MutableRefObject<HTMLDivElement | null>;
+    estimateSize: (item: T) => number;
+    overscanPx: number;
+    resetKey: string;
+    initialTailRows: number;
+  },
+) {
+  const measuredHeightsRef = useRef<Map<string, number>>(new Map());
+  const [measureVersion, setMeasureVersion] = useState(0);
+  const [viewport, setViewport] = useState({ scrollTop: 0, height: 0 });
+
+  useEffect(() => {
+    measuredHeightsRef.current.clear();
+    setMeasureVersion((version) => version + 1);
+    setViewport({ scrollTop: 0, height: 0 });
+  }, [resetKey]);
+
+  useEffect(() => {
+    if (!enabled) return undefined;
+    const el = containerRef.current;
+    if (!el) return undefined;
+    let frame: number | null = null;
+    const readViewport = () => {
+      frame = null;
+      setViewport((current) => {
+        const next = {
+          scrollTop: el.scrollTop,
+          height: el.clientHeight || CHAT_VIRTUAL_DEFAULT_VIEWPORT_PX,
+        };
+        return current.scrollTop === next.scrollTop && current.height === next.height
+          ? current
+          : next;
+      });
+    };
+    const scheduleRead = () => {
+      if (frame !== null) return;
+      frame = requestAnimationFrame(readViewport);
+    };
+    scheduleRead();
+    el.addEventListener('scroll', scheduleRead, { passive: true });
+    const observer =
+      typeof ResizeObserver !== 'undefined'
+        ? new ResizeObserver(scheduleRead)
+        : null;
+    observer?.observe(el);
+    return () => {
+      if (frame !== null) cancelAnimationFrame(frame);
+      el.removeEventListener('scroll', scheduleRead);
+      observer?.disconnect();
+    };
+  }, [containerRef, enabled]);
+
+  const layout = useMemo(() => {
+    const offsets: number[] = [];
+    const sizes: number[] = [];
+    let cursor = 0;
+    for (const item of items) {
+      offsets.push(cursor);
+      const measured = measuredHeightsRef.current.get(item.key);
+      const size = Math.max(
+        CHAT_VIRTUAL_MIN_ROW_HEIGHT,
+        measured ?? estimateSize(item),
+      );
+      sizes.push(size);
+      cursor += size;
+    }
+    return { offsets, sizes, totalHeight: cursor };
+  }, [estimateSize, items, measureVersion]);
+
+  const rows = useMemo(() => {
+    if (!enabled || items.length === 0) return [];
+    const height = viewport.height || CHAT_VIRTUAL_DEFAULT_VIEWPORT_PX;
+    if (viewport.scrollTop === 0 && viewport.height === 0) {
+      const start = Math.max(0, items.length - initialTailRows);
+      return items.slice(start).map((item, offset) => {
+        const index = start + offset;
+        return { item, index, top: layout.offsets[index] ?? 0 };
+      });
+    }
+    const startTarget = Math.max(0, viewport.scrollTop - overscanPx);
+    const endTarget = viewport.scrollTop + height + overscanPx;
+    let start = 0;
+    while (
+      start < items.length - 1
+      && (layout.offsets[start] ?? 0) + (layout.sizes[start] ?? 0) < startTarget
+    ) {
+      start += 1;
+    }
+    let end = start;
+    while (end < items.length && (layout.offsets[end] ?? 0) <= endTarget) {
+      end += 1;
+    }
+    return items.slice(start, end).map((item, offset) => {
+      const index = start + offset;
+      return { item, index, top: layout.offsets[index] ?? 0 };
+    });
+  }, [
+    enabled,
+    initialTailRows,
+    items,
+    layout.offsets,
+    layout.sizes,
+    overscanPx,
+    viewport.height,
+    viewport.scrollTop,
+  ]);
+
+  const onMeasure = useCallback((key: string, height: number) => {
+    if (!Number.isFinite(height) || height <= 0) return;
+    const next = Math.max(CHAT_VIRTUAL_MIN_ROW_HEIGHT, Math.ceil(height));
+    const previous = measuredHeightsRef.current.get(key);
+    if (previous !== undefined && Math.abs(previous - next) < 2) return;
+    measuredHeightsRef.current.set(key, next);
+    setMeasureVersion((version) => version + 1);
+  }, []);
+
+  return {
+    rows,
+    totalHeight: layout.totalHeight,
+    onMeasure,
+  };
 }
 
 // Pinned task list above the chat composer. The latest TodoWrite snapshot
@@ -1336,43 +1997,97 @@ function PinnedTodoSlot({
 
 function QueuedSendStrip({
   containerRef,
+  editingId,
   items,
+  onEdit,
   onRemove,
+  onReorder,
   onSendNow,
-  onUpdate,
 }: {
   containerRef?: MutableRefObject<HTMLDivElement | null>;
-  items: Array<{ id: string; prompt: string }>;
+  editingId?: string | null;
+  items: QueuedSendItem[];
+  onEdit?: (item: QueuedSendItem) => void;
   onRemove?: (id: string) => void;
+  onReorder?: (orderedIds: string[]) => void;
   onSendNow?: (id: string) => void;
-  onUpdate?: (id: string, prompt: string) => void;
 }) {
   const t = useT();
-  const [editingId, setEditingId] = useState<string | null>(null);
-  const [editingDraft, setEditingDraft] = useState('');
+  const [dragState, setDragState] = useState<QueuedSendDragState | null>(null);
   if (items.length === 0) return null;
-  const visible = items.slice(0, QUEUED_SEND_VISIBLE_LIMIT);
-  const extra = items.length - visible.length;
-  const startEdit = (item: { id: string; prompt: string }) => {
-    setEditingId(item.id);
-    setEditingDraft(item.prompt);
+  const canReorder = Boolean(onReorder && items.length > 1);
+  const overflowCount = Math.max(0, items.length - QUEUED_SEND_VISIBLE_ROW_COUNT);
+
+  const handleDragStart = (
+    event: ReactDragEvent<HTMLButtonElement>,
+    item: QueuedSendItem,
+  ) => {
+    if (!canReorder) return;
+    event.dataTransfer.effectAllowed = 'move';
+    event.dataTransfer.setData(QUEUED_SEND_DRAG_MIME, item.id);
+    event.dataTransfer.setData('text/plain', item.id);
+    setDragState({ draggingId: item.id, overId: item.id, edge: null });
   };
-  const commitEdit = () => {
-    if (!editingId) return;
-    const next = editingDraft.trim();
-    if (next) onUpdate?.(editingId, next);
-    setEditingId(null);
-    setEditingDraft('');
+
+  const handleDragOver = (
+    event: ReactDragEvent<HTMLDivElement>,
+    targetId: string,
+  ) => {
+    if (!canReorder) return;
+    const draggingId = dragState?.draggingId || event.dataTransfer.getData(QUEUED_SEND_DRAG_MIME);
+    if (!draggingId) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'move';
+    if (draggingId === targetId) {
+      if (dragState?.overId !== targetId || dragState.edge !== null) {
+        setDragState({ draggingId, overId: targetId, edge: null });
+      }
+      return;
+    }
+    const edge = queuedDropEdgeForEvent(event);
+    if (
+      dragState?.draggingId !== draggingId
+      || dragState.overId !== targetId
+      || dragState.edge !== edge
+    ) {
+      setDragState({ draggingId, overId: targetId, edge });
+    }
   };
-  const cancelEdit = () => {
-    setEditingId(null);
-    setEditingDraft('');
+
+  const handleDrop = (
+    event: ReactDragEvent<HTMLDivElement>,
+    targetId: string,
+  ) => {
+    if (!canReorder) return;
+    event.preventDefault();
+    const draggingId =
+      dragState?.draggingId
+      || event.dataTransfer.getData(QUEUED_SEND_DRAG_MIME)
+      || event.dataTransfer.getData('text/plain');
+    if (!draggingId || draggingId === targetId) {
+      setDragState(null);
+      return;
+    }
+    const edge = dragState?.overId === targetId && dragState.edge
+      ? dragState.edge
+      : queuedDropEdgeForEvent(event);
+    const nextIds = reorderQueuedSendIds(items, draggingId, targetId, edge);
+    if (nextIds.join('\0') !== items.map((item) => item.id).join('\0')) {
+      onReorder?.(nextIds);
+    }
+    setDragState(null);
   };
+
   return (
     <div
       ref={containerRef}
       className="chat-queued-send-strip"
       data-testid="chat-queued-send-strip"
+      onDragLeave={(event) => {
+        const related = event.relatedTarget;
+        if (related instanceof Node && event.currentTarget.contains(related)) return;
+        setDragState(null);
+      }}
     >
       <div className="chat-queued-send-header">
         <div className="chat-queued-send-heading">
@@ -1383,73 +2098,61 @@ function QueuedSendStrip({
           <span>{t('chat.queuedToSend')}</span>
         </div>
       </div>
-      {visible.map((item, index) => (
-        <div
-          className={`chat-queued-send-row${index === 0 ? ' chat-queued-send-row-active' : ''}${
-            editingId === item.id ? ' chat-queued-send-row-editing' : ''
-          }`}
-          key={item.id}
-        >
-          {editingId === item.id ? (
-            <form
-              className="chat-queued-send-edit-form"
-              onSubmit={(event) => {
-                event.preventDefault();
-                commitEdit();
-              }}
+      <div className={`chat-queued-send-list${overflowCount > 0 ? ' is-scrollable' : ''}`}>
+        {items.map((item, index) => {
+          const isDragging = dragState?.draggingId === item.id;
+          const dropClass = dragState?.overId === item.id
+            && dragState.draggingId !== item.id
+            && dragState.edge
+            ? ` chat-queued-send-row-drop-${dragState.edge}`
+            : '';
+          return (
+            <div
+              className={`chat-queued-send-row${index === 0 ? ' chat-queued-send-row-active' : ''}${
+                editingId === item.id ? ' chat-queued-send-row-editing' : ''
+              }${isDragging ? ' chat-queued-send-row-dragging' : ''}${dropClass}`}
+              key={item.id}
+              onDragOver={(event) => handleDragOver(event, item.id)}
+              onDrop={(event) => handleDrop(event, item.id)}
             >
-              <input
-                className="chat-queued-send-edit-input"
-                value={editingDraft}
-                // eslint-disable-next-line jsx-a11y/no-autofocus
-                autoFocus
-                onChange={(event) => setEditingDraft(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === 'Escape') {
-                    event.preventDefault();
-                    cancelEdit();
-                  }
-                }}
-                aria-label={t('chat.queuedEditQueuedTaskAria')}
-              />
-              <button
-                type="submit"
-                className="chat-queued-send-action"
-                title={t('chat.queuedSave')}
-                aria-label={t('chat.queuedSave')}
-                disabled={!editingDraft.trim()}
-              >
-                <Icon name="check" size={13} />
-              </button>
               <button
                 type="button"
-                className="chat-queued-send-action"
-                title={t('chat.queuedCancel')}
-                aria-label={t('chat.queuedCancel')}
-                onClick={cancelEdit}
+                className="chat-queued-send-drag-handle chat-queued-send-tooltip od-tooltip"
+                title={t('chat.queuedReorder')}
+                data-tooltip={t('chat.queuedReorder')}
+                data-tooltip-placement="right"
+                aria-label={t('chat.queuedReorder')}
+                draggable={canReorder}
+                disabled={!canReorder}
+                onDragStart={(event) => handleDragStart(event, item)}
+                onDragEnd={() => setDragState(null)}
               >
-                <Icon name="close" size={13} />
+                <Icon name="grip-vertical" size={14} />
               </button>
-            </form>
-          ) : (
-            <>
-              <span className="chat-queued-send-title">{summarizeQueuedPrompt(item.prompt, t)}</span>
+              <div className="chat-queued-send-main">
+                <span className="chat-queued-send-title">{summarizeQueuedPrompt(item, t)}</span>
+                <QueuedSendMetaChips item={item} />
+              </div>
               <div className="chat-queued-send-actions">
-                {onUpdate ? (
+                {onEdit ? (
                   <button
                     type="button"
-                    className="chat-queued-send-action"
+                    className="chat-queued-send-action chat-queued-send-tooltip od-tooltip"
                     title={t('chat.queuedEdit')}
+                    data-tooltip={t('chat.queuedEdit')}
+                    data-tooltip-placement="top"
                     aria-label={t('chat.queuedEdit')}
-                    onClick={() => startEdit(item)}
+                    onClick={() => onEdit(item)}
                   >
                     <Icon name="pencil" size={13} />
                   </button>
                 ) : null}
                 <button
                   type="button"
-                  className="chat-queued-send-action"
+                  className="chat-queued-send-action chat-queued-send-tooltip od-tooltip"
                   title={t('chat.send')}
+                  data-tooltip={t('chat.send')}
+                  data-tooltip-placement="top"
                   aria-label={t('chat.send')}
                   onClick={() => onSendNow?.(item.id)}
                   disabled={!onSendNow}
@@ -1459,36 +2162,100 @@ function QueuedSendStrip({
                 {onRemove ? (
                   <button
                     type="button"
-                    className="chat-queued-send-action"
+                    className="chat-queued-send-action chat-queued-send-tooltip od-tooltip"
                     onClick={() => onRemove(item.id)}
                     title={t('chat.comments.remove')}
+                    data-tooltip={t('chat.comments.remove')}
+                    data-tooltip-placement="top"
                     aria-label={t('chat.comments.remove')}
                   >
                     <Icon name="trash" size={13} />
                   </button>
                 ) : null}
               </div>
-            </>
-          )}
-        </div>
-      ))}
-      {extra > 0 ? (
+            </div>
+          );
+        })}
+      </div>
+      {overflowCount > 0 ? (
         <div className="chat-queued-send-overflow">
-          <span className="chat-queued-send-overflow-line" aria-hidden />
-          <span className="chat-queued-send-extra">+{extra}</span>
-          <span>{t('chat.queuedMore')}</span>
+          +{overflowCount} {t('chat.queuedMore')}
         </div>
       ) : null}
     </div>
   );
 }
 
-const QUEUED_SEND_VISIBLE_LIMIT = 4;
+const QUEUED_SEND_DRAG_MIME = 'application/x-open-design-queued-send';
+const QUEUED_SEND_VISIBLE_ROW_COUNT = 4;
 
-function summarizeQueuedPrompt(prompt: string, t: TranslateFn): string {
-  const normalized = prompt.replace(/\s+/g, ' ').trim();
-  if (!normalized) return t('chat.queuedFollowUpFallback');
-  return normalized.length > 58 ? `${normalized.slice(0, 57)}...` : normalized;
+type QueuedSendDropEdge = 'before' | 'after';
+
+interface QueuedSendDragState {
+  draggingId: string;
+  overId: string | null;
+  edge: QueuedSendDropEdge | null;
+}
+
+function queuedDropEdgeForEvent(event: ReactDragEvent<HTMLElement>): QueuedSendDropEdge {
+  const rect = event.currentTarget.getBoundingClientRect();
+  return event.clientY < rect.top + rect.height / 2 ? 'before' : 'after';
+}
+
+function reorderQueuedSendIds(
+  items: QueuedSendItem[],
+  draggingId: string,
+  targetId: string,
+  edge: QueuedSendDropEdge,
+): string[] {
+  const ids = items.map((item) => item.id);
+  const from = ids.indexOf(draggingId);
+  if (from < 0) return ids;
+  const [draggedId] = ids.splice(from, 1);
+  const targetIndex = ids.indexOf(targetId);
+  if (targetIndex < 0 || !draggedId) return items.map((item) => item.id);
+  ids.splice(edge === 'after' ? targetIndex + 1 : targetIndex, 0, draggedId);
+  return ids;
+}
+
+function summarizeQueuedPrompt(item: QueuedSendItem, t: TranslateFn): string {
+  const normalized = item.prompt.replace(/\s+/g, ' ').trim();
+  const text = normalized || t('chat.queuedFollowUpFallback');
+  return text.length > 58 ? `${text.slice(0, 57)}...` : text;
+}
+
+// Surfaces what a queued turn carries — attachments, visual marks, and the
+// staged plugin / skill / MCP / connector context from its meta — as compact
+// chips so the user can see (and trust) what will be sent without expanding it.
+// Counts use the same plain-English style as the rest of this strip.
+function QueuedSendMetaChips({ item }: { item: QueuedSendItem }) {
+  const ctx = item.meta?.context;
+  const files = item.attachments?.length ?? 0;
+  const marks = item.commentAttachments?.length ?? 0;
+  const plugins = item.meta?.appliedPluginSnapshot ? 1 : ctx?.pluginIds?.length ?? 0;
+  const skills = ctx?.skillIds?.length ?? 0;
+  const mcp = ctx?.mcpServerIds?.length ?? 0;
+  const connectors = ctx?.connectorIds?.length ?? 0;
+  const workspace = ctx?.workspaceItems?.length ?? 0;
+  const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`;
+  const chips: Array<{ key: string; label: string }> = [];
+  if (files > 0) chips.push({ key: 'files', label: plural(files, 'file') });
+  if (marks > 0) chips.push({ key: 'marks', label: plural(marks, 'mark') });
+  if (plugins > 0) chips.push({ key: 'plugins', label: plural(plugins, 'plugin') });
+  if (skills > 0) chips.push({ key: 'skills', label: plural(skills, 'skill') });
+  if (mcp > 0) chips.push({ key: 'mcp', label: `${mcp} MCP` });
+  if (connectors > 0) chips.push({ key: 'connectors', label: plural(connectors, 'connector') });
+  if (workspace > 0) chips.push({ key: 'workspace', label: plural(workspace, 'workspace context') });
+  if (chips.length === 0) return null;
+  return (
+    <div className="chat-queued-send-chips">
+      {chips.map((chip) => (
+        <span key={chip.key} className="chat-queued-send-chip">
+          {chip.label}
+        </span>
+      ))}
+    </div>
+  );
 }
 
 function CommentsPanel({
@@ -1640,15 +2407,46 @@ export function isAssistantMessageStreaming(
   return true;
 }
 
+function filterConversations(
+  conversations: Conversation[],
+  query: string,
+  t: TranslateFn,
+): Conversation[] {
+  const normalized = query.trim().toLocaleLowerCase();
+  if (!normalized) return conversations;
+  return conversations.filter((conversation) => {
+    const title = conversation.title || t('chat.untitledConversation');
+    const meta = conversationMetaLabel(conversation, t);
+    return `${title} ${conversation.id} ${meta}`.toLocaleLowerCase().includes(normalized);
+  });
+}
+
+function conversationMessageCount(
+  conversation: Conversation,
+  activeConversationId: string | null,
+  activeMessageCount: number,
+): number | null {
+  if (conversation.id === activeConversationId) return activeMessageCount;
+  return typeof conversation.messageCount === 'number' ? conversation.messageCount : null;
+}
+
+function compactCount(value: number): string {
+  if (value < 1000) return String(value);
+  const compact = Math.floor(value / 100) / 10;
+  return `${compact}k`;
+}
+
 function ConversationRow({
   conversation,
   active,
+  messageCount,
   onSelect,
   onDelete,
   t,
 }: {
   conversation: Conversation;
   active: boolean;
+  messageCount: number | null;
   onSelect: () => void;
   onDelete: () => void;
   t: TranslateFn;
@@ -1670,7 +2468,10 @@ function ConversationRow({
       >
         {displayTitle}
       </button>
-      <span className="chat-conv-item-meta">{conversationMetaLabel(conversation, t)}</span>
+      <span className="chat-conv-item-meta">
+        {messageCount !== null ? `${compactCount(messageCount)} msg · ` : ''}
+        {conversationMetaLabel(conversation, t)}
+      </span>
       <button
         type="button"
         className="chat-conv-item-del"
@@ -1691,11 +2492,17 @@ function ConversationRow({
   );
 }
 
-function UserMessage({
+// Memoized (hoisted impl referenced below): a static user message has stable
+// props, so it skips re-render while a later turn streams.
+const UserMessage = memo(UserMessageImpl);
+
+function UserMessageImpl({
   message,
   projectId,
   projectFileNames,
   onRequestOpenFile,
+  onRequestPluginDetails,
+  onRequestDesignSystemDetails,
   t,
   activePluginSnapshot,
   activeDesignSystem,
@@ -1704,12 +2511,22 @@ function UserMessage({
   projectId: string | null;
   projectFileNames?: Set<string>;
   onRequestOpenFile?: (name: string) => void;
+  onRequestPluginDetails?: (pluginId: string) => void;
+  onRequestDesignSystemDetails?: (system: DesignSystemSummary) => void;
   t: TranslateFn;
   activePluginSnapshot?: AppliedPluginSnapshot | null;
   activeDesignSystem?: DesignSystemSummary | null;
 }) {
-  const attachments = message.attachments ?? [];
+  const attachments = sortChatAttachmentsForDisplay(message.attachments ?? []);
   const commentAttachments = message.commentAttachments ?? [];
+  const workspaceItems = message.runContext?.workspaceItems ?? [];
+  const messagePluginSnapshot = message.appliedPluginSnapshot ?? activePluginSnapshot ?? null;
+  const hasRunContext = Boolean(
+    message.sessionMode ||
+      workspaceItems.length > 0 ||
+      messagePluginSnapshot ||
+      activeDesignSystem,
+  );
   const [copied, setCopied] = useState(false);
   const copyTimerRef = useRef<ReturnType<typeof setTimeout>>();
 
@@ -1739,15 +2556,36 @@ function UserMessage({
         <span>{t('chat.you')}</span>
         <MessageTimestamp message={message} t={t} />
       </div>
-      {activePluginSnapshot ? (
-        <ActivePluginChip snapshot={activePluginSnapshot} t={t} />
-      ) : null}
-      {activeDesignSystem ? (
-        <ActiveDesignSystemChip system={activeDesignSystem} />
+      {hasRunContext ? (
+        <div className="msg-run-context-row" data-testid="msg-run-context-row">
+          {message.sessionMode ? (
+            <MessageSessionModeChip mode={message.sessionMode} t={t} />
+          ) : null}
+          {workspaceItems.map((item) => (
+            <ActiveWorkspaceContextChip
+              key={`${item.kind}:${item.id}`}
+              item={item}
+              onOpen={onRequestOpenFile}
+            />
+          ))}
+          {messagePluginSnapshot ? (
+            <ActivePluginChip
+              snapshot={messagePluginSnapshot}
+              t={t}
+              onOpenDetails={onRequestPluginDetails}
+            />
+          ) : null}
+          {activeDesignSystem ? (
+            <ActiveDesignSystemChip
+              system={activeDesignSystem}
+              onOpenDetails={onRequestDesignSystemDetails}
+            />
+          ) : null}
+        </div>
       ) : null}
       {attachments.length > 0 ? (
         <div className="user-attachments">
-          {attachments.map((a) => {
+          {attachments.map((a, index) => {
             const baseName = a.path.split('/').pop() || a.path;
             const openable =
               !!onRequestOpenFile &&
@@ -1764,6 +2602,9 @@ function UserMessage({
                 disabled={!openable}
                 title={openable ? t('chat.openFile', { name: baseName }) : a.path}
               >
+                <span className="staged-order" aria-label={`Attachment ${index + 1}`}>
+                  {index + 1}
+                </span>
                 {a.kind === 'image' && projectId ? (
                   <img src={projectRawUrl(projectId, a.path)} alt={a.name} />
                 ) : (
@@ -1779,9 +2620,9 @@ function UserMessage({
         <div className="user-attachments comment-history-attachments">
           {commentAttachments.filter((attachment) => attachment.selectionKind !== 'visual').map((a) => (
             <span key={a.id} className="user-attachment staged-comment">
-              <span className="staged-name" title={`${commentTargetDisplayName(a)}: ${a.comment}`}>
+              <span className="staged-name" title={a.comment ? `${commentTargetDisplayName(a)}: ${a.comment}` : commentTargetDisplayName(a)}>
                 <strong>{commentTargetDisplayName(a)}</strong>
-                <span>{a.comment}</span>
+                {a.comment ? <span>{a.comment}</span> : null}
               </span>
             </span>
           ))}
@@ -1825,15 +2666,17 @@ function UserMessage({
 function ActivePluginChip({
   snapshot,
   t: _t,
+  onOpenDetails,
 }: {
   snapshot: AppliedPluginSnapshot;
   t: TranslateFn;
+  onOpenDetails?: (pluginId: string) => void;
 }) {
   const title = snapshot.pluginTitle ?? snapshot.pluginId;
   const version = snapshot.pluginVersion;
   const taskKind = snapshot.taskKind;
-  return (
-    <div className="msg-plugin-chip" data-testid="msg-plugin-chip">
+  const content = (
+    <>
       <span className="msg-plugin-chip__dot" aria-hidden />
       <span className="msg-plugin-chip__label">
         <span className="msg-plugin-chip__kind">Plugin</span>
@@ -1843,17 +2686,63 @@ function ActivePluginChip({
       {taskKind ? (
         <span className="msg-plugin-chip__task">{taskKind}</span>
       ) : null}
+    </>
+  );
+  // One clean chip per message — the plugin's full resolved context still
+  // rides the run via the persisted snapshot; we no longer fan it out into
+  // per-category (design-system / asset / skill) chips here.
+  return (
+    <div className="msg-plugin-context" data-testid="msg-plugin-context">
+      {onOpenDetails ? (
+        <button
+          type="button"
+          className="msg-plugin-chip msg-plugin-chip--action"
+          data-testid="msg-plugin-chip"
+          title={title}
+          onClick={() => onOpenDetails(snapshot.pluginId)}
+        >
+          {content}
+        </button>
+      ) : (
+        <div className="msg-plugin-chip" data-testid="msg-plugin-chip">
+          {content}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MessageSessionModeChip({
+  mode,
+  t,
+}: {
+  mode: ChatSessionMode;
+  t: TranslateFn;
+}) {
+  const label = mode === 'chat'
+    ? t('chat.mode.chat.label')
+    : t('chat.mode.design.label');
+  return (
+    <div
+      className={`msg-mode-chip msg-mode-chip--${mode}`}
+      data-testid="msg-session-mode-chip"
+      title={label}
+    >
+      <Icon name={mode === 'chat' ? 'comment' : 'sparkles'} size={12} />
+      <span>{label}</span>
     </div>
   );
 }
 
 function ActiveDesignSystemChip({
   system,
+  onOpenDetails,
 }: {
   system: DesignSystemSummary;
+  onOpenDetails?: (system: DesignSystemSummary) => void;
 }) {
-  return (
-    <div className="msg-plugin-chip msg-plugin-chip--design-system" data-testid="msg-design-system-chip">
+  const content = (
+    <>
       <span className="msg-plugin-chip__dot" aria-hidden />
       <span className="msg-plugin-chip__label">
         <span className="msg-plugin-chip__kind">Design System</span>
@@ -1862,8 +2751,139 @@ function ActiveDesignSystemChip({
       {system.category ? (
         <span className="msg-plugin-chip__task">{system.category}</span>
       ) : null}
-    </div>
+    </>
   );
+  if (!onOpenDetails) {
+    return (
+      <div className="msg-plugin-chip msg-plugin-chip--design-system" data-testid="msg-design-system-chip">
+        {content}
+      </div>
+    );
+  }
+  return (
+    <button
+      type="button"
+      className="msg-plugin-chip msg-plugin-chip--design-system msg-plugin-chip--action"
+      data-testid="msg-design-system-chip"
+      title={system.title}
+      onClick={() => onOpenDetails(system)}
+    >
+      {content}
+    </button>
+  );
+}
+
+const WORKSPACE_DESIGN_FILES_TAB = '__design_files__';
+const WORKSPACE_DESIGN_SYSTEM_TAB = '__design_system__';
+
+function ActiveWorkspaceContextChip({
+  item,
+  onOpen,
+}: {
+  item: WorkspaceContextItem;
+  onOpen?: (name: string) => void;
+}) {
+  const target = workspaceContextOpenTarget(item);
+  const content = (
+    <>
+      <span className="msg-plugin-chip__icon" aria-hidden>
+        <Icon name={workspaceContextIcon(item)} size={12} />
+      </span>
+      <span className="msg-plugin-chip__label">
+        <span className="msg-plugin-chip__kind">Current</span>
+        <span className="msg-plugin-chip__title">{item.label}</span>
+      </span>
+    </>
+  );
+  if (!target || !onOpen) {
+    return (
+      <div
+        className={`msg-plugin-chip msg-plugin-chip--workspace msg-plugin-chip--workspace-${item.kind}`}
+        data-testid="msg-workspace-context-chip"
+        title={workspaceContextTitle(item)}
+      >
+        {content}
+      </div>
+    );
+  }
+  return (
+    <button
+      type="button"
+      className={`msg-plugin-chip msg-plugin-chip--workspace msg-plugin-chip--workspace-${item.kind} msg-plugin-chip--action`}
+      data-testid="msg-workspace-context-chip"
+      title={workspaceContextTitle(item)}
+      onClick={() => onOpen(target)}
+    >
+      {content}
+    </button>
+  );
+}
+
+function workspaceContextOpenTarget(item: WorkspaceContextItem): string | null {
+  if (item.tabId) return item.tabId;
+  if (item.kind === 'design-files') return WORKSPACE_DESIGN_FILES_TAB;
+  if (item.kind === 'design-system') return WORKSPACE_DESIGN_SYSTEM_TAB;
+  if (item.kind === 'file' || item.kind === 'live-artifact') {
+    return item.path ?? item.label;
+  }
+  return null;
+}
+
+function workspaceContextIcon(item: WorkspaceContextItem): IconName {
+  if (item.kind === 'browser') return 'globe';
+  if (item.kind === 'folder' || item.kind === 'design-files') return 'folder';
+  if (item.kind === 'terminal') return 'terminal';
+  if (item.kind === 'side-chat') return 'comment';
+  if (item.kind === 'design-system') return 'blocks';
+  return 'file';
+}
+
+function workspaceContextTitle(item: WorkspaceContextItem): string {
+  return [
+    workspaceContextKindLabel(item.kind),
+    item.path ? `path: ${item.path}` : null,
+    item.absolutePath ? `absolute: ${item.absolutePath}` : null,
+    item.url ? `url: ${item.url}` : null,
+    item.title ? `title: ${item.title}` : null,
+  ].filter(Boolean).join(' | ');
+}
+
+function workspaceContextKindLabel(kind: WorkspaceContextItem['kind']): string {
+  switch (kind) {
+    case 'browser':
+      return 'Browser';
+    case 'design-files':
+      return 'Design files';
+    case 'design-system':
+      return 'Design system';
+    case 'folder':
+      return 'Folder';
+    case 'terminal':
+      return 'Terminal';
+    case 'side-chat':
+      return 'Side chat';
+    case 'live-artifact':
+      return 'Live artifact';
+    case 'file':
+    default:
+      return 'File';
+  }
+}
+
+function sortChatAttachmentsForDisplay(attachments: ChatAttachment[]): ChatAttachment[] {
+  return attachments
+    .map((attachment, index) => ({ attachment, index }))
+    .sort((a, b) => {
+      const aOrder = typeof a.attachment.order === 'number' && Number.isFinite(a.attachment.order)
+        ? a.attachment.order
+        : a.index;
+      const bOrder = typeof b.attachment.order === 'number' && Number.isFinite(b.attachment.order)
+        ? b.attachment.order
+        : b.index;
+      if (aOrder !== bOrder) return aOrder - bOrder;
+      return a.index - b.index;
+    })
+    .map((entry) => entry.attachment);
 }
 
 function DaySeparator({ ts }: { ts: number | undefined }) {

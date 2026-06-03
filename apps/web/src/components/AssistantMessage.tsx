@@ -1,4 +1,4 @@
-import { Fragment, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ToolCard } from "./ToolCard";
 import { FileOpsSummary } from "./FileOpsSummary";
 import {
@@ -6,6 +6,7 @@ import {
   type MarkdownLinkClickHandler,
 } from "../runtime/markdown";
 import { asInProjectFilePath } from "../runtime/in-project-link";
+import { copyToClipboard } from "../lib/copy-to-clipboard";
 import { projectFileUrl } from "../providers/registry";
 import { submitChatRunToolResult } from "../providers/daemon";
 import { useAnalytics } from "../analytics/provider";
@@ -318,10 +319,56 @@ interface Props {
   // shows a banner that focuses the tab on click.
   onOpenQuestions?: () => void;
   onContinueRemainingTasks?: (todos: TodoItem[]) => void;
+  onForkFromMessage?: () => void;
+  forking?: boolean;
   onFeedback?: (change: ChatMessageFeedbackChange) => void;
   suppressDirectionForms?: boolean;
   hasDesignSystemContext?: boolean;
 }
+
+// Props compared by reference to decide whether a memoized AssistantMessage can
+// skip re-rendering. The four interaction callbacks (onSubmitForm,
+// onContinueRemainingTasks, onForkFromMessage, onFeedback) are DELIBERATELY
+// excluded: ChatPane re-creates them per render, but routes them through a ref
+// so their behavior is reference-stable — comparing them would defeat the memo
+// on every streamed frame. `isLast` is compared, which captures the only state
+// transition those callbacks' presence depends on. The remaining context props
+// (projectFiles, the Set props, handlers) come from ProjectView as stable
+// useState/useMemo/useCallback values, so reference comparison is correct and
+// cheap.
+const ASSISTANT_MESSAGE_COMPARED_PROPS: Array<keyof Props> = [
+  'message',
+  'streaming',
+  'projectId',
+  'projectKind',
+  'conversationId',
+  'projectFiles',
+  'projectFileNames',
+  'onRequestOpenFile',
+  'onRequestPluginFolderAgentAction',
+  'activePluginActionPaths',
+  'hiddenPluginActionPaths',
+  'isLast',
+  'errorCardOwnerId',
+  'nextUserContent',
+  'forking',
+  'suppressDirectionForms',
+  'hasDesignSystemContext',
+];
+
+function areAssistantMessagePropsEqual(prev: Props, next: Props): boolean {
+  for (const key of ASSISTANT_MESSAGE_COMPARED_PROPS) {
+    if (!Object.is(prev[key], next[key])) return false;
+  }
+  return true;
+}
+
+/**
+ * Memoized so a streamed frame only re-renders the ONE assistant message whose
+ * `message` object changed identity (the streaming turn), not all N messages in
+ * the conversation. See `areAssistantMessagePropsEqual` for the comparison.
+ */
+export const AssistantMessage = memo(AssistantMessageImpl, areAssistantMessagePropsEqual);
 
 /**
  * Renders an assistant message as an interleaved flow of:
@@ -332,7 +379,7 @@ interface Props {
  *     the individual tool cards. Mirrors the chat surface in screenshot 9.
  *   - status pills
  */
-export function AssistantMessage({
+function AssistantMessageImpl({
   message,
   streaming,
   projectId,
@@ -350,6 +397,8 @@ export function AssistantMessage({
   onSubmitForm,
   onOpenQuestions,
   onContinueRemainingTasks,
+  onForkFromMessage,
+  forking = false,
   onFeedback,
   suppressDirectionForms = false,
   hasDesignSystemContext = false,
@@ -365,8 +414,10 @@ export function AssistantMessage({
   // above the composer, so we strip any TodoWrite tool-groups out of the
   // per-message flow to avoid the same task list rendering twice.
   const blocks = stripTodoToolGroups(
-    suppressDuplicateQuestionForms(
-      suppressAskUserQuestionFallbackText(buildBlocks(events)),
+    stripEmptyThinkingBlocks(
+      suppressDuplicateQuestionForms(
+        suppressAskUserQuestionFallbackText(buildBlocks(events)),
+      ),
     ),
   );
   const fileOps = useMemo(() => deriveFileOps(events), [events]);
@@ -466,6 +517,8 @@ export function AssistantMessage({
     !!isLast &&
     unfinishedTodos.length > 0 &&
     !!onContinueRemainingTasks;
+  const canFork = !streaming && !!onForkFromMessage;
+  const copyMarkdown = message.content.trim().length > 0 ? message.content : undefined;
   const showFeedback =
     !!onFeedback &&
     isFeedbackEligible({
@@ -481,7 +534,9 @@ export function AssistantMessage({
     !!message.endedAt ||
     !!usage ||
     unfinishedTodos.length > 0 ||
-    hasEmptyResponse;
+    hasEmptyResponse ||
+    !!copyMarkdown ||
+    canFork;
   // Track which forms the user submitted in this session so we lock them
   // immediately on click (without waiting for the parent to re-render).
   const [locallySubmitted, setLocallySubmitted] = useState<Set<string>>(
@@ -666,6 +721,9 @@ export function AssistantMessage({
                   usage,
                   hasUnfinishedTodos: unfinishedTodos.length > 0,
                   hasEmptyResponse,
+                  copyMarkdown,
+                  onFork: canFork ? onForkFromMessage : undefined,
+                  forking,
                   forceVisible: true,
                 }}
               />
@@ -677,6 +735,9 @@ export function AssistantMessage({
                 usage={usage}
                 hasUnfinishedTodos={unfinishedTodos.length > 0}
                 hasEmptyResponse={hasEmptyResponse}
+                copyMarkdown={copyMarkdown}
+                onFork={canFork ? onForkFromMessage : undefined}
+                forking={forking}
               />
             )}
           </div>
@@ -802,6 +863,9 @@ interface AssistantFooterProps {
   usage: Extract<AgentEvent, { kind: "usage" }> | undefined;
   hasUnfinishedTodos: boolean;
   hasEmptyResponse: boolean;
+  copyMarkdown?: string;
+  onFork?: () => void;
+  forking?: boolean;
   feedbackControls?: ReactNode;
   forceVisible?: boolean;
 }
@@ -813,6 +877,9 @@ function AssistantFooter({
   usage,
   hasUnfinishedTodos,
   hasEmptyResponse,
+  copyMarkdown,
+  onFork,
+  forking = false,
   feedbackControls,
   forceVisible = false,
 }: AssistantFooterProps) {
@@ -831,7 +898,9 @@ function AssistantFooter({
     !elapsed &&
     !usage &&
     !hasUnfinishedTodos &&
-    !hasEmptyResponse
+    !hasEmptyResponse &&
+    !copyMarkdown &&
+    !onFork
   )
     return null;
   return (
@@ -856,8 +925,87 @@ function AssistantFooter({
           : ""}
         {costLabel}
       </span>
-      {feedbackControls}
+      {copyMarkdown || onFork || feedbackControls ? (
+        <span className="assistant-footer-controls">
+          {copyMarkdown ? <AssistantMarkdownCopyButton markdown={copyMarkdown} /> : null}
+          {onFork ? (
+            <AssistantForkButton
+              disabled={forking}
+              onFork={onFork}
+            />
+          ) : null}
+          {feedbackControls}
+        </span>
+      ) : null}
     </div>
+  );
+}
+
+function AssistantForkButton({
+  disabled,
+  onFork,
+}: {
+  disabled: boolean;
+  onFork: () => void;
+}) {
+  const t = useT();
+  const label = disabled
+    ? t("assistant.forkingConversation")
+    : t("assistant.forkConversation");
+  return (
+    <button
+      type="button"
+      className="assistant-copy-button od-tooltip"
+      disabled={disabled}
+      data-tooltip={label}
+      data-tooltip-placement="top"
+      onClick={onFork}
+      aria-label={label}
+      title={label}
+    >
+      <Icon name={disabled ? "spinner" : "fork"} size={13} />
+    </button>
+  );
+}
+
+function AssistantMarkdownCopyButton({ markdown }: { markdown: string }) {
+  const t = useT();
+  const [copied, setCopied] = useState(false);
+  const copyTimerRef = useRef<ReturnType<typeof setTimeout>>();
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+    };
+  }, []);
+
+  async function handleCopy() {
+    if (copyTimerRef.current) clearTimeout(copyTimerRef.current);
+    const ok = await copyToClipboard(markdown);
+    if (!ok) return;
+    setCopied(true);
+    copyTimerRef.current = setTimeout(() => {
+      setCopied(false);
+      copyTimerRef.current = undefined;
+    }, 2000);
+  }
+
+  const label = copied ? t("chat.copyDone") : t("assistant.copyMarkdown");
+  return (
+    <button
+      type="button"
+      className="assistant-copy-button od-tooltip"
+      data-copied={copied ? "true" : "false"}
+      data-tooltip={label}
+      data-tooltip-placement="top"
+      onClick={() => {
+        void handleCopy();
+      }}
+      aria-label={label}
+      title={label}
+    >
+      <Icon name={copied ? "check" : "copy"} size={13} />
+    </button>
   );
 }
 
@@ -1146,8 +1294,10 @@ function AssistantFeedback({
     >
       <button
         type="button"
-        className="assistant-feedback-button"
+        className="assistant-feedback-button od-tooltip"
         data-selected={selected === "positive" ? "true" : "false"}
+        data-tooltip={t("assistant.feedbackPositive")}
+        data-tooltip-placement="top"
         aria-pressed={selected === "positive"}
         aria-label={t("assistant.feedbackPositive")}
         title={t("assistant.feedbackPositive")}
@@ -1171,8 +1321,10 @@ function AssistantFeedback({
       </button>
       <button
         type="button"
-        className="assistant-feedback-button"
+        className="assistant-feedback-button od-tooltip"
         data-selected={selected === "negative" ? "true" : "false"}
+        data-tooltip={t("assistant.feedbackNegative")}
+        data-tooltip-placement="top"
         aria-pressed={selected === "negative"}
         aria-label={t("assistant.feedbackNegative")}
         title={t("assistant.feedbackNegative")}
@@ -2238,6 +2390,13 @@ function stripTodoToolGroups(blocks: Block[]): Block[] {
   return blocks.filter((block) => {
     if (block.kind !== "tool-group") return true;
     return !block.items.every((it) => isTodoWriteToolName(it.use.name));
+  });
+}
+
+function stripEmptyThinkingBlocks(blocks: Block[]): Block[] {
+  return blocks.filter((block) => {
+    if (block.kind !== "thinking") return true;
+    return block.text.trim().length > 0;
   });
 }
 

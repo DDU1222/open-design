@@ -18,6 +18,8 @@ import {
   type SetStateAction,
 } from 'react';
 import { useT } from '../i18n';
+import { useAnalytics } from '../analytics/provider';
+import { recordAmrEntry, type AmrEntryAttribution } from '../analytics/amr-attribution';
 import { KNOWN_PROVIDERS } from '../state/config';
 import { fetchProviderModels } from '../providers/provider-models';
 import { SUGGESTED_MODELS_BY_PROTOCOL } from '../state/apiProtocols';
@@ -134,6 +136,7 @@ export function InlineModelSwitcher({
   onOpenSettings,
 }: Props) {
   const t = useT();
+  const analytics = useAnalytics();
   const [open, setOpen] = useState(false);
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const providerModelsFetchingRef = useRef<Set<string>>(new Set());
@@ -202,12 +205,14 @@ export function InlineModelSwitcher({
     }, AMR_LOGIN_POLL_INTERVAL_MS);
   }, [refreshAmrStatus, stopAmrPolling]);
 
-  const handleAmrSignIn = useCallback(async () => {
+  const handleAmrSignIn = useCallback(async (
+    attribution?: AmrEntryAttribution | null,
+  ) => {
     const startedAt = Date.now();
     amrLoginStartedAtRef.current = startedAt;
     setAmrLoginError(false);
     setAmrLoginPending(true);
-    const result = await startVelaLogin();
+    const result = await startVelaLogin(attribution);
     if (!result.ok && !result.alreadyRunning) {
       amrLoginStartedAtRef.current = null;
       setAmrLoginPending(false);
@@ -236,12 +241,17 @@ export function InlineModelSwitcher({
         await handleAmrCancelLogin();
         return;
       }
+      const attribution = recordAmrEntry(
+        analytics.track,
+        'inline_model_switcher_amr_row',
+      );
       const latest = await refreshAmrStatus();
       if (latest?.loggedIn) return;
-      await handleAmrSignIn();
+      await handleAmrSignIn(attribution);
     },
     [
       amrLoginPending,
+      analytics.track,
       handleAmrCancelLogin,
       handleAmrSignIn,
       onAgentChange,
