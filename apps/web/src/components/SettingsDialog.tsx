@@ -312,7 +312,21 @@ type TestState =
 const GATEWAY_API_PROTOCOLS = new Set<ApiProtocol>([
   'ollama',
   'senseaudio',
+  'aihubmix',
 ]);
+
+// Providers whose live model fetch IS their full account catalogue, so the
+// per-option "from your account" badge and the "Loaded N from your account"
+// hint are noise — every option carries the same badge and distinguishes
+// nothing. For these we drop the source label and show a plain count instead.
+// Add a protocol here when the same applies to another provider.
+const ACCOUNT_MODEL_SOURCE_LABEL_HIDDEN = new Set<ApiProtocol>([
+  'aihubmix',
+]);
+
+function hidesAccountModelSourceLabel(protocol: ApiProtocol): boolean {
+  return ACCOUNT_MODEL_SOURCE_LABEL_HIDDEN.has(protocol);
+}
 
 type ProviderModelsState =
   | { status: 'idle' }
@@ -529,7 +543,7 @@ const API_KEY_CONSOLE_LINKS: Record<ApiProtocol, { host: string; url: string }> 
   },
   aihubmix: {
     host: 'aihubmix.com',
-    url: 'https://console.aihubmix.com/token',
+    url: 'https://aihubmix.com',
   },
 };
 
@@ -3967,6 +3981,7 @@ export function SettingsDialog({
                   id: m.id,
                   label: apiModelOptionLabel(
                     m,
+                    !hidesAccountModelSourceLabel(apiProtocol) &&
                     loadedAccountModelCount > 0
                       ? fetchedApiModelIds.has(m.id)
                         ? t('settings.modelSourceAccount')
@@ -3976,9 +3991,12 @@ export function SettingsDialog({
                 }))}
                 modelsLoadedFromAccountMessage={
                   loadedAccountModelCount > 0
-                    ? t('settings.modelsLoadedFromAccount', {
-                        count: loadedAccountModelCount,
-                      })
+                    ? t(
+                        hidesAccountModelSourceLabel(apiProtocol)
+                          ? 'settings.modelsLoadedCount'
+                          : 'settings.modelsLoadedFromAccount',
+                        { count: loadedAccountModelCount },
+                      )
                     : null
                 }
                 providerModelsFailureMessage={providerModelsFailureMessage}

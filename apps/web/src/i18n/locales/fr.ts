@@ -273,6 +273,7 @@ export const fr: Dict = {
   'settings.model': 'Modèle',
   'settings.apiKeyInvalid': 'Clé API invalide.',
   'settings.modelsLoadedFromAccount': '✓ {count} modèles chargés depuis votre compte.',
+  'settings.modelsLoadedCount': '✓ {count} modèles chargés.',
   'settings.fetchModels': 'Récupérer les modèles',
   'settings.fetchModelsTitle': 'Récupérer les modèles disponibles auprès de ce fournisseur',
   'settings.fetchModelsRunning': 'Récupération des modèles…',

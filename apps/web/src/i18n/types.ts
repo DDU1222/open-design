@@ -295,6 +295,7 @@ export interface Dict {
   'settings.apiKeyInvalid': string;
   'settings.apiKeyCleaned': string;
   'settings.modelsLoadedFromAccount': string;
+  'settings.modelsLoadedCount': string;
   'settings.modelSourceAccount': string;
   'settings.modelSourceSuggested': string;
   'settings.fetchModels': string;
