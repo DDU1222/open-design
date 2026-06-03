@@ -2,13 +2,13 @@ import {
   forwardRef,
   useEffect,
   useImperativeHandle,
-  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   type ReactNode,
 } from "react";
 import { createPortal } from 'react-dom';
+import { Button } from '@open-design/components';
 import { useI18n, useT } from '../i18n';
 import type { Dict } from '../i18n/types';
 import {
@@ -57,6 +57,7 @@ import {
   type TrackedInsertion,
 } from '../utils/pluginInsertionTracking';
 import { ANNOTATION_EVENT, type AnnotationEventDetail } from "./PreviewDrawOverlay";
+import { SearchableModelSelect } from './modelOptions';
 import { DesignSystemSwitchPicker } from "./DesignSystemSwitchPicker";
 
 type TranslateFn = (key: keyof Dict, vars?: Record<string, string | number>) => string;
@@ -172,6 +173,10 @@ interface Props {
   // ChatPane). Pass `null` (or omit) to render the full rail.
   pinnedPluginId?: string | null;
   footerAccessory?: ReactNode;
+  // Design-system picker slot rendered at the top of the composer (above
+  // the textarea). The former standalone chrome header row was removed;
+  // ProjectView owns the project record so it renders the picker as a slot.
+  designSystemPicker?: ReactNode;
   // Project's current `designSystemId`. The mid-chat design-system picker
   // uses this to surface a "current" indicator and to no-op a redundant
   // switch. Optional so test/screenshot harnesses can omit it.
@@ -255,6 +260,7 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
       onProjectSkillChange,
       pinnedPluginId = null,
       footerAccessory,
+      designSystemPicker,
       currentDesignSystemId = null,
       onActiveDesignSystemChange,
       onShowToast,
@@ -410,13 +416,11 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
     const [toolsTab, setToolsTab] = useState<ToolsTab>('plugins');
     const fileInputRef = useRef<HTMLInputElement | null>(null);
     const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+    const textareaResizeFrameRef = useRef<number | null>(null);
     const composingRef = useRef(false);
     const toolsMenuRef = useRef<HTMLDivElement | null>(null);
     const toolsTriggerRef = useRef<HTMLButtonElement | null>(null);
     const petEnabled = Boolean(onAdoptPet && onTogglePet);
-    const [petMenuOpen, setPetMenuOpen] = useState(false);
-    const petWrapRef = useRef<HTMLDivElement | null>(null);
-    const [petMenuStyle, setPetMenuStyle] = useState<React.CSSProperties>({});
     const linkedDirs = projectMetadata?.linkedDirs ?? [];
     // initialDraft is only honored on the first non-empty value the parent
     // hands us. After we seed once, the composer is fully under user control
@@ -460,58 +464,6 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
       };
     }, [toolsOpen]);
 
-    useEffect(() => {
-      if (!petMenuOpen) return;
-      function onPointer(e: MouseEvent) {
-        const target = e.target as Node;
-        if (petWrapRef.current?.contains(target)) return;
-        setPetMenuOpen(false);
-      }
-      function onKey(e: KeyboardEvent) {
-        if (e.key === 'Escape') setPetMenuOpen(false);
-      }
-      document.addEventListener('mousedown', onPointer);
-      document.addEventListener('keydown', onKey);
-      return () => {
-        document.removeEventListener('mousedown', onPointer);
-        document.removeEventListener('keydown', onKey);
-      };
-    }, [petMenuOpen]);
-
-    // Viewport-aware pet menu positioning — flips the popover to stay
-    // within screen bounds instead of clipping at the edge.
-    useEffect(() => {
-      if (!petMenuOpen) return;
-      const wrap = petWrapRef.current;
-      if (!wrap) return;
-      const rect = wrap.getBoundingClientRect();
-      const menuW = 260;
-      const menuH = 200;
-      const gap = 6;
-      const viewW = window.innerWidth;
-      const viewH = window.innerHeight;
-      // Prefer opening upward (bottom of menu above the button).
-      // Flip downward when there isn't enough room above.
-      // When neither direction fits, clamp to viewport bounds.
-      let top: number;
-      if (rect.top >= menuH + gap) {
-        top = rect.top - menuH - gap;
-      } else if (rect.bottom + menuH + gap <= viewH) {
-        top = rect.bottom + gap;
-      } else {
-        top = Math.max(gap, viewH - menuH - gap);
-      }
-      // Right-align by default (menu right edge ≈ button right edge).
-      // Shift left when the menu would spill past the viewport left edge.
-      const left = Math.max(8, Math.min(viewW - menuW - 8, rect.right - menuW));
-      setPetMenuStyle({
-        position: 'fixed',
-        top,
-        left,
-        bottom: 'auto',
-        right: 'auto',
-      });
-    }, [petMenuOpen]);
 
     // Lazy-fetch the user's external MCP servers list once on mount so the
     // `/mcp …` slash palette and the composer's MCP button popover have
@@ -600,16 +552,37 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
       if (!ta) return;
       const maxHeight = composerTextareaMaxHeight();
       ta.style.height = 'auto';
+      const scrollHeight = ta.scrollHeight;
       const nextHeight = Math.min(
-        Math.max(ta.scrollHeight, COMPOSER_TEXTAREA_MIN_HEIGHT),
+        Math.max(scrollHeight, COMPOSER_TEXTAREA_MIN_HEIGHT),
         maxHeight,
       );
       ta.style.height = `${nextHeight}px`;
-      ta.style.overflowY = ta.scrollHeight > maxHeight ? 'auto' : 'hidden';
+      ta.style.overflowY = scrollHeight > maxHeight ? 'auto' : 'hidden';
     }
 
-    useLayoutEffect(() => {
-      resizeTextarea();
+    useEffect(() => {
+      if (
+        typeof window === 'undefined' ||
+        typeof window.requestAnimationFrame !== 'function' ||
+        typeof window.cancelAnimationFrame !== 'function'
+      ) {
+        resizeTextarea();
+        return;
+      }
+      if (textareaResizeFrameRef.current !== null) {
+        window.cancelAnimationFrame(textareaResizeFrameRef.current);
+      }
+      textareaResizeFrameRef.current = window.requestAnimationFrame(() => {
+        textareaResizeFrameRef.current = null;
+        resizeTextarea();
+      });
+      return () => {
+        if (textareaResizeFrameRef.current !== null) {
+          window.cancelAnimationFrame(textareaResizeFrameRef.current);
+          textareaResizeFrameRef.current = null;
+        }
+      };
     }, [draft, composerMentionParts, staged.length, stagedSkills.length]);
 
     useEffect(() => {
@@ -1707,6 +1680,11 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
         onDrop={handleDrop}
       >
         <div className="composer-shell">
+          {designSystemPicker ? (
+            <div className="composer-design-system-row">
+              {designSystemPicker}
+            </div>
+          ) : null}
           {stagedSkills.length > 0 ? (
             <StagedSkills
               skills={stagedSkills}
@@ -1769,30 +1747,28 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
               >
                 {t('settings.byokImageModel')}
               </label>
-              <select
+              <SearchableModelSelect
                 id="composer-byok-image-model-select"
+                className="inline-switcher__select composer-byok-image-model__select"
                 value={byokImageModel ?? ''}
-                onChange={(e) => onChangeByokImageModel(e.target.value)}
-                style={{
-                  background: 'transparent',
-                  border: '1px solid var(--border, #444)',
-                  borderRadius: 4,
-                  padding: '2px 6px',
-                  color: 'inherit',
-                  fontSize: 12,
-                }}
-              >
-                <option value="">
-                  {byokImageModelOptions[0]?.label
-                    ? `${byokImageModelOptions[0].label} (${t('settings.byokModelDefaultOption')})`
-                    : t('settings.byokModelDefaultOption')}
-                </option>
-                {byokImageModelOptions.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.label}
-                  </option>
-                ))}
-              </select>
+                onChange={(value) => onChangeByokImageModel(value)}
+                // Live catalogue from the shared hook: AIHubMix's image models
+                // for aihubmix, the static SenseAudio registry otherwise. Keeps
+                // the picker in sync with Settings / the daemon default.
+                models={byokImageModelOptions.map((m) => ({ id: m.id, label: m.label }))}
+                additionalOptions={[
+                  {
+                    value: '',
+                    label: byokImageModelOptions[0]?.label
+                      ? `${byokImageModelOptions[0].label} (${t('settings.byokModelDefaultOption')})`
+                      : t('settings.byokModelDefaultOption'),
+                  },
+                ]}
+                searchPlaceholder={t('newproj.modelSearch')}
+                searchInputTestId="composer-byok-image-model-search"
+                popoverTestId="composer-byok-image-model-popover"
+                style={{ fontSize: 12 }}
+              />
             </div>
           ) : null}
           {byokApiProtocol === 'aihubmix' && onChangeByokVideoModel ? (
@@ -2353,72 +2329,8 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
                 </div>
               ) : null}
             </div>
-            {petEnabled ? (
-              <div className="composer-pet-wrap" ref={petWrapRef}>
-                <button
-                  type="button"
-                  className={`composer-pet${petConfig?.adopted ? ' adopted' : ''}`}
-                  onClick={() => {
-                    if (petConfig?.adopted) {
-                      if (!petConfig.enabled) setPetMenuOpen(true);
-                      else setPetMenuOpen((v) => !v);
-                    } else {
-                      setPetMenuOpen((v) => !v);
-                    }
-                  }}
-                  title={t('pet.composerTitle')}
-                  aria-haspopup="menu"
-                  aria-expanded={petMenuOpen}
-                  aria-label={t('pet.composerTitle')}
-                >
-                  <span className="composer-pet-glyph">
-                    {petConfig?.adopted ? (petConfig?.custom?.glyph || '🐾') : '🐾'}
-                  </span>
-                  <span className="composer-pet-label">
-                    {petConfig?.adopted ? (petConfig?.custom?.name || 'Buddy') : t('pet.composerMenuTitle')}
-                  </span>
-                </button>
-                {petMenuOpen ? (
-                  <div
-                    className="composer-pet-menu"
-                    style={petMenuStyle}
-                  >
-                    <div className="composer-pet-menu-head">
-                      <strong>{t('pet.composerMenuTitle')}</strong>
-                      <span>{t('pet.composerMenuHint')}</span>
-                    </div>
-                    <button
-                      type="button"
-                      className="composer-pet-menu-row toggle"
-                      onClick={() => {
-                        if (petConfig?.adopted) {
-                          onTogglePet?.();
-                        } else {
-                          onOpenPetSettings?.();
-                        }
-                        setPetMenuOpen(false);
-                      }}
-                    >
-                      <Icon name={petConfig?.enabled ? 'eye-off' : 'eye'} size={12} />
-                      <span>{petConfig?.enabled ? t('pet.tuck') : t('pet.wake')}</span>
-                    </button>
-                    <button
-                      type="button"
-                      className="composer-pet-menu-row settings"
-                      onClick={() => {
-                        onOpenPetSettings?.();
-                        setPetMenuOpen(false);
-                      }}
-                    >
-                      <Icon name="settings" size={12} />
-                      <span>{t('pet.composerOpenSettings')}</span>
-                    </button>
-                  </div>
-                ) : null}
-              </div>
-            ) : null}
-            <button
-              className="icon-btn"
+            <Button
+              size="icon"
               data-testid="chat-attach"
               onClick={() => {
                 trackChatPanelClick(analytics.track, {
@@ -2437,7 +2349,7 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
               ) : (
                 <Icon name="attach" size={15} />
               )}
-            </button>
+            </Button>
             {footerAccessory}
             <span className="composer-spacer" />
             {showStopButton ? (

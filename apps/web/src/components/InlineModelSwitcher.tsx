@@ -20,13 +20,14 @@ import {
 import { useT } from '../i18n';
 import { KNOWN_PROVIDERS } from '../state/config';
 import { fetchProviderModels } from '../providers/provider-models';
+import { SUGGESTED_MODELS_BY_PROTOCOL } from '../state/apiProtocols';
 import {
   cancelVelaLogin,
   fetchVelaLoginStatus,
   startVelaLogin,
   type VelaLoginStatus,
 } from '../providers/daemon';
-import type { AgentInfo, ApiProtocol, AppConfig, ExecMode, ProviderModelOption } from '../types';
+import type { AgentInfo, ApiProtocol, AppConfig, ExecMode } from '../types';
 import { apiProtocolLabel } from '../utils/apiProtocol';
 import { AgentIcon } from './AgentIcon';
 import { Icon } from './Icon';
@@ -40,10 +41,16 @@ import {
 } from './amrLoginPolling';
 import { normalizeAgentModelChoice } from './agentModelSelection';
 import { SearchableModelSelect } from './modelOptions';
+import {
+  mergeProviderModelOptions,
+  providerModelsCacheKey,
+  type ProviderModelsCache,
+} from './providerModelsCache';
 
 interface Props {
   config: AppConfig;
   agents: AgentInfo[];
+  providerModelsCache?: ProviderModelsCache;
   daemonLive: boolean;
   onModeChange: (mode: ExecMode) => void;
   onAgentChange: (id: string) => void;
@@ -53,13 +60,10 @@ interface Props {
   ) => void;
   onApiProtocolChange: (protocol: ApiProtocol) => void;
   onApiModelChange: (model: string) => void;
-  providerModelsCache?: Record<string, ProviderModelOption[]>;
   /** Lets the home picker warm the shared cache itself. Without it the picker
    *  only READS the cache (warmed by Settings/onboarding), so on a fresh load
    *  the BYOK list falls back to the small static seed list. */
-  onProviderModelsCacheChange?: Dispatch<
-    SetStateAction<Record<string, ProviderModelOption[]>>
-  >;
+  onProviderModelsCacheChange?: Dispatch<SetStateAction<ProviderModelsCache>>;
   onOpenSettings: (
     section?:
       | 'execution'
@@ -119,13 +123,13 @@ function displayAgentChipName(agent: Pick<AgentInfo, 'id' | 'name'>): string {
 export function InlineModelSwitcher({
   config,
   agents,
+  providerModelsCache,
   daemonLive,
   onModeChange,
   onAgentChange,
   onAgentModelChange,
   onApiProtocolChange,
   onApiModelChange,
-  providerModelsCache,
   onProviderModelsCacheChange,
   onOpenSettings,
 }: Props) {
@@ -381,12 +385,6 @@ export function InlineModelSwitcher({
         : null;
 
   const apiProtocol = config.apiProtocol ?? 'anthropic';
-  const providerModelsInputKey = [
-    apiProtocol,
-    config.baseUrl.trim().replace(/\/+$/, ''),
-    config.apiKey.trim(),
-    config.apiVersion?.trim() ?? '',
-  ].join('\n');
   const providerForProtocol = useMemo(
     () =>
       KNOWN_PROVIDERS.find(
@@ -398,7 +396,17 @@ export function InlineModelSwitcher({
       ) ?? KNOWN_PROVIDERS.find((p) => p.protocol === apiProtocol),
     [apiProtocol, config.apiProviderBaseUrl],
   );
-  const fetchedProviderModels = providerModelsCache?.[providerModelsInputKey] ?? [];
+  const providerModelsKey = useMemo(
+    () =>
+      providerModelsCacheKey(
+        apiProtocol,
+        config.baseUrl,
+        config.apiKey,
+        config.apiVersion ?? '',
+      ),
+    [apiProtocol, config.apiKey, config.apiVersion, config.baseUrl],
+  );
+  const fetchedApiModelOptions = providerModelsCache?.[providerModelsKey] ?? [];
 
   // Warm the shared provider-models cache from the home picker itself. The
   // picker otherwise depends on Settings/onboarding having fetched first, so on
@@ -406,7 +414,7 @@ export function InlineModelSwitcher({
   // the live catalogue. We fetch when the panel is open in BYOK mode and the
   // preconditions for the active protocol are met (AIHubMix's catalogue is
   // public, so it needs no key; every other protocol needs one). Results are
-  // keyed identically to Settings (`providerModelsInputKey`), so a single fetch
+  // keyed identically to Settings (`providerModelsKey`), so a single fetch
   // serves both surfaces and replaces any stale slot.
   useEffect(() => {
     if (!open || config.mode !== 'api' || !onProviderModelsCacheChange) return;
@@ -414,8 +422,8 @@ export function InlineModelSwitcher({
     if (apiProtocol !== 'aihubmix' && !config.apiKey.trim()) return;
     const baseUrl = config.baseUrl.trim();
     if (!/^https?:\/\//i.test(baseUrl)) return;
-    const key = providerModelsInputKey;
-    if (fetchedProviderModels.length) return;
+    const key = providerModelsKey;
+    if (fetchedApiModelOptions.length) return;
     if (providerModelsFetchingRef.current.has(key)) return;
     providerModelsFetchingRef.current.add(key);
     let active = true;
@@ -447,20 +455,32 @@ export function InlineModelSwitcher({
     config.apiKey,
     config.baseUrl,
     apiProtocol,
-    providerModelsInputKey,
-    fetchedProviderModels.length,
+    providerModelsKey,
+    fetchedApiModelOptions.length,
     onProviderModelsCacheChange,
   ]);
 
-  const apiModelOptions = useMemo(() => {
-    const discovered = fetchedProviderModels.map((model) => model.id);
-    const staticOptions = providerForProtocol?.models ?? [];
-    const merged = new Set<string>([...discovered, ...staticOptions]);
-    if (config.model.trim()) merged.add(config.model.trim());
-    return Array.from(merged);
-  }, [config.model, fetchedProviderModels, providerForProtocol?.models]);
+  const suggestedApiModelIds = useMemo(
+    () =>
+      Array.from(
+        new Set(
+          providerForProtocol?.models?.length
+            ? providerForProtocol.models
+            : SUGGESTED_MODELS_BY_PROTOCOL[apiProtocol],
+        ),
+      ),
+    [apiProtocol, providerForProtocol],
+  );
+  const apiModelOptions = useMemo(
+    () => mergeProviderModelOptions(fetchedApiModelOptions, suggestedApiModelIds),
+    [fetchedApiModelOptions, suggestedApiModelIds],
+  );
+  const apiModelIds = useMemo(
+    () => apiModelOptions.map((model) => model.id),
+    [apiModelOptions],
+  );
   const apiModelChoices = useMemo(
-    () => apiModelOptions.map((id) => ({ id, label: id })),
+    () => apiModelOptions.map((model) => ({ id: model.id, label: model.label })),
     [apiModelOptions],
   );
 
@@ -796,7 +816,7 @@ export function InlineModelSwitcher({
                     value={config.model}
                     onChange={(nextValue) => onApiModelChange?.(nextValue)}
                     additionalOptions={
-                      config.model && !apiModelOptions.includes(config.model)
+                      config.model && !apiModelIds.includes(config.model)
                         ? [
                             {
                               value: config.model,

@@ -44,7 +44,10 @@ import type { AgentModelOption, ApiProtocol, ExecMode } from '../types';
 import {
   SUGGESTED_MODELS_BY_PROTOCOL,
 } from '../state/apiProtocols';
-import { CUSTOM_MODEL_SENTINEL, SearchableModelSelect } from './modelOptions';
+import {
+  CUSTOM_MODEL_SENTINEL,
+  SearchableModelSelect,
+} from './modelOptions';
 
 interface Props {
   mode: ExecMode;
@@ -398,12 +401,6 @@ export function MemoryModelInline({
     setCustomEditing(false);
   }, [customDraft, persist, buildOverride]);
 
-  // CLI mode with no models advertised by the agent — fall back to a
-  // simple "Same as chat" / "Custom..." pair so the picker is still
-  // usable. (Some CLIs don't expose a `models` command; the chat
-  // picker shows the same fallback there.)
-  const showSuggestedOptions = modelOptions.length > 0;
-
   // Stable unique id for the labelling span so multiple instances of
   // this picker (or instances rendered alongside other Memory pickers)
   // never collide on a global selector. The select uses
@@ -413,6 +410,27 @@ export function MemoryModelInline({
   // `getByLabel('API key' / 'Model')` on the surrounding chat form
   // can't accidentally cross-match the hint copy here.
   const labelId = useId();
+  const sameAsChatLabel = sameAsChatCliLabel
+    ? t('settings.memoryModelInlineSameAsChatWithModel', {
+        model: sameAsChatCliLabel,
+      })
+    : effectiveChatProtocol
+      ? t('settings.memoryModelInlineSameAsChatWithProvider', {
+          provider: effectiveChatProtocol,
+        })
+      : chatModel
+        ? t('settings.memoryModelInlineSameAsChatWithModel', {
+            model: chatModel,
+          })
+        : t('settings.memoryModelInlineSameAsChat');
+  const selectOptions = useMemo(
+    () => [
+      { id: SAME_AS_CHAT_SENTINEL, label: sameAsChatLabel },
+      ...modelOptions.map((model) => ({ id: model, label: model })),
+      { id: CUSTOM_MODEL_SENTINEL, label: t('settings.modelCustom') },
+    ],
+    [modelOptions, sameAsChatLabel, t],
+  );
 
   // The wrapper used to be a <label>, which made the select's
   // accessible name absorb every text descendant (the flash status,
@@ -444,34 +462,14 @@ export function MemoryModelInline({
       ) : null}
       <SearchableModelSelect
         aria-labelledby={labelId}
-        disabled={busy}
-        // "Same as chat" leads the list (it's the default); the live model
-        // catalogue follows; "Custom…" is pinned last via additionalOptions.
-        models={[
-          {
-            id: SAME_AS_CHAT_SENTINEL,
-            label: sameAsChatCliLabel
-              ? t('settings.memoryModelInlineSameAsChatWithModel', {
-                  model: sameAsChatCliLabel,
-                })
-              : effectiveChatProtocol
-                ? t('settings.memoryModelInlineSameAsChatWithProvider', {
-                    provider: effectiveChatProtocol,
-                  })
-                : chatModel
-                  ? t('settings.memoryModelInlineSameAsChatWithModel', {
-                      model: chatModel,
-                    })
-                  : t('settings.memoryModelInlineSameAsChat'),
-          },
-          ...(showSuggestedOptions ? pickerModels : []),
-        ]}
-        value={selectValue}
-        onChange={(value) => void onSelectChange(value)}
+        className="inline-switcher__select settings-model-select settings-model-select--byok"
         searchPlaceholder={t('designs.searchPlaceholder')}
-        additionalOptions={[
-          { value: CUSTOM_MODEL_SENTINEL, label: t('settings.modelCustom') },
-        ]}
+        popoverClassName="settings-byok-select-popover"
+        minSearchableOptions={Number.POSITIVE_INFINITY}
+        models={selectOptions}
+        value={selectValue}
+        disabled={busy}
+        onChange={(value) => void onSelectChange(value)}
       />
       {customActive ? (
         <div

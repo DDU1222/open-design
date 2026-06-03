@@ -109,11 +109,20 @@ function loadOnce(type: AIHubMixCatalogType): Promise<MediaModel[]> {
  * the first fetch resolves). Safe to call from any picker; the underlying
  * request is shared across mounts.
  */
-export function useAIHubMixModels(type: AIHubMixCatalogType): MediaModel[] {
+export function useAIHubMixModels(
+  type: AIHubMixCatalogType,
+  enabled = true,
+): MediaModel[] {
   const [models, setModels] = useState<MediaModel[]>(
     () => cachedModels.get(type) ?? [],
   );
   useEffect(() => {
+    // Only the AIHubMix BYOK pickers consume the live catalogue; for every
+    // other provider the option hooks fall back to the static registry, so
+    // there's no reason to hit the public endpoint. Skipping the fetch also
+    // keeps surfaces that merely mount a picker (e.g. Settings on a non-AIHubMix
+    // protocol) from issuing a catalogue request on every mount.
+    if (!enabled) return;
     let active = true;
     loadOnce(type)
       .then((fetched) => {
@@ -125,23 +134,23 @@ export function useAIHubMixModels(type: AIHubMixCatalogType): MediaModel[] {
     return () => {
       active = false;
     };
-  }, [type]);
+  }, [type, enabled]);
   return models;
 }
 
 /** Live AIHubMix image-generation models. */
-export function useAIHubMixImageModels(): MediaModel[] {
-  return useAIHubMixModels('image_generation');
+export function useAIHubMixImageModels(enabled = true): MediaModel[] {
+  return useAIHubMixModels('image_generation', enabled);
 }
 
 /** Live AIHubMix video models. */
-export function useAIHubMixVideoModels(): MediaModel[] {
-  return useAIHubMixModels('video');
+export function useAIHubMixVideoModels(enabled = true): MediaModel[] {
+  return useAIHubMixModels('video', enabled);
 }
 
 /** Live AIHubMix speech (TTS) models. */
-export function useAIHubMixAudioModels(): MediaModel[] {
-  return useAIHubMixModels('tts');
+export function useAIHubMixAudioModels(enabled = true): MediaModel[] {
+  return useAIHubMixModels('tts', enabled);
 }
 
 /**
@@ -155,7 +164,7 @@ export function useAIHubMixAudioModels(): MediaModel[] {
 export function useByokImageModelOptions(
   provider: string | undefined,
 ): MediaModel[] {
-  const dynamic = useAIHubMixImageModels();
+  const dynamic = useAIHubMixImageModels(provider === 'aihubmix');
   return useMemo(() => {
     if (provider === 'aihubmix') {
       return mergeAihubmixModels(IMAGE_MODELS, dynamic).filter(
@@ -175,7 +184,7 @@ export function useByokImageModelOptions(
 export function useByokVideoModelOptions(
   provider: string | undefined,
 ): MediaModel[] {
-  const dynamic = useAIHubMixVideoModels();
+  const dynamic = useAIHubMixVideoModels(provider === 'aihubmix');
   return useMemo(() => {
     if (provider === 'aihubmix') {
       return mergeAihubmixModels(VIDEO_MODELS, dynamic).filter(
@@ -195,7 +204,7 @@ export function useByokVideoModelOptions(
 export function useByokSpeechModelOptions(
   provider: string | undefined,
 ): MediaModel[] {
-  const dynamic = useAIHubMixAudioModels();
+  const dynamic = useAIHubMixAudioModels(provider === 'aihubmix');
   const speechSeeds = useMemo(
     () => AUDIO_MODELS_BY_KIND.speech,
     [],
