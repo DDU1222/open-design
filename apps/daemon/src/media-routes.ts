@@ -237,6 +237,9 @@ export function registerMediaRoutes(app: Express, ctx: RegisterMediaRoutesDeps) 
   // (which strips the prefix to the wire name). Falls back to the cached copy
   // on upstream failure so a transient blip doesn't empty the picker.
   app.get('/api/media/providers/aihubmix/models', async (req, res) => {
+    if (!isLocalSameOrigin(req, getResolvedPort())) {
+      return res.status(403).json({ error: 'cross-origin request rejected' });
+    }
     const raw = req.query.type;
     const type: AIHubMixCatalogType =
       raw === 'llm' || raw === 'video' || raw === 'tts'

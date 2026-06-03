@@ -15,7 +15,7 @@
 import path from 'node:path';
 import { writeFile, readFile, readdir, stat } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
-import { assertExternalAssetUrl } from './connectionTest.js';
+import { assertExternalAssetUrl, assertAndFetchExternalAsset } from './connectionTest.js';
 import { resolveProviderConfig } from './media-config.js';
 import { IMAGE_MODELS } from './media-models.js';
 import { ensureProject } from './projects.js';
@@ -1074,9 +1074,7 @@ export async function executeAIHubMixGenerateImage(
       if (entry.b64_json) {
         bytes = Buffer.from(entry.b64_json, 'base64');
       } else if (entry.url) {
-        const urlCheck = await assertExternalAssetUrl(entry.url);
-        if (!urlCheck.ok) return { ok: false, error: urlCheck.error };
-        const imgResp = await fetch(entry.url, withToolRequestInit(ctx, { redirect: 'error' }));
+        const imgResp = await assertAndFetchExternalAsset(entry.url, withToolRequestInit(ctx, {}));
         if (!imgResp.ok) return { ok: false, error: `image download ${imgResp.status}` };
         bytes = Buffer.from(await imgResp.arrayBuffer());
       } else {
@@ -1634,23 +1632,24 @@ export async function executeAIHubMixGenerateVideo(
   }
 
   // Step 3: download the mp4 bytes. Re-validate any returned URL through
-  // assertExternalAssetUrl so a malicious gateway can't point us at the cloud
-  // metadata service or an RFC1918 host via the response payload.
+  // assertAndFetchExternalAsset so a malicious gateway can't point us at the
+  // cloud metadata service or an RFC1918 host via the response payload, nor via
+  // a redirect from a validated public URL.
   console.log(
     `[proxy:aihubmix] generate_video completed task=${taskId} download=${directUrl || `${trimmedBase}/videos/${encodeURIComponent(taskId)}/content`}`,
   );
   let bytes: Buffer;
   try {
     if (directUrl) {
-      const urlCheck = await assertExternalAssetUrl(directUrl);
-      if (!urlCheck.ok) return { ok: false, error: urlCheck.error };
-      // Authenticated download when the asset is on the AIHubMix origin;
-      // a signed third-party CDN URL is fetched without our key. Redirects
-      // are followed so an AIHubMix URL can hand off to a signed CDN.
+      // Authenticated download when the asset is on the AIHubMix origin; a
+      // signed third-party CDN URL is fetched without our key. Redirects are
+      // rejected (assertAndFetchExternalAsset pins redirect:'error') so a
+      // validated public URL can't 302 the daemon into private/metadata space,
+      // nor leak our Bearer/APP-Code to the redirect target.
       let host = '';
       try { host = new URL(directUrl).host; } catch { /* keep host empty */ }
       const sendAuth = sameOrigin(directUrl, trimmedBase);
-      let dl = await fetch(
+      let dl = await assertAndFetchExternalAsset(
         directUrl,
         withToolRequestInit(ctx, sendAuth ? { headers: { ...aihubmixHeaders(apiKey) } } : {}),
       );
@@ -1659,7 +1658,7 @@ export async function executeAIHubMixGenerateVideo(
       // the key — the asset was clearly meant to be fetched authenticated.
       if (!dl.ok && !sendAuth && (dl.status === 401 || dl.status === 403)
           && sameRegistrableDomain(directUrl, trimmedBase)) {
-        dl = await fetch(directUrl, withToolRequestInit(ctx, { headers: { ...aihubmixHeaders(apiKey) } }));
+        dl = await assertAndFetchExternalAsset(directUrl, withToolRequestInit(ctx, { headers: { ...aihubmixHeaders(apiKey) } }));
       }
       if (!dl.ok) return { ok: false, error: `aihubmix video download ${dl.status} (${host})` };
       bytes = Buffer.from(await dl.arrayBuffer());

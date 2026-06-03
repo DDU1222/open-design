@@ -63,7 +63,7 @@ import {
   findProvider,
   modelsForSurface,
 } from './media-models.js';
-import { assertExternalAssetUrl } from './connectionTest.js';
+import { assertAndFetchExternalAsset } from './connectionTest.js';
 import { resolveModelAlias, resolveProviderConfig } from './media-config.js';
 import {
   ensureProject,
@@ -2877,16 +2877,11 @@ async function renderSenseAudioImage(ctx: MediaContext, credentials: ProviderCon
   if (!url) {
     throw new Error('senseaudio image response missing url');
   }
-  // Mirror the chat-tool SSRF guard (byok-tools.ts): the gateway-returned
-  // `url` is attacker-controllable inside a successful response, so DNS-
-  // resolve it through validateBaseUrlResolved and refuse loopback /
-  // RFC1918 / metadata-service hosts. Pair with `redirect: 'error'` so a
-  // 3xx hop into private space is also blocked.
-  const urlCheck = await assertExternalAssetUrl(url);
-  if (!urlCheck.ok) {
-    throw new Error(`senseaudio image ${urlCheck.error}`);
-  }
-  const imgResp = await fetch(url, withMediaRequestInit(ctx, { redirect: 'error' }));
+  // The gateway-returned `url` is attacker-controllable inside a successful
+  // response. assertAndFetchExternalAsset DNS-resolves it and refuses loopback /
+  // RFC1918 / metadata-service hosts, and pins `redirect: 'error'` so a 3xx hop
+  // from a validated public URL into private space is blocked too.
+  const imgResp = await assertAndFetchExternalAsset(url, withMediaRequestInit(ctx));
   if (!imgResp.ok) {
     throw new Error(`senseaudio image fetch ${imgResp.status}`);
   }
@@ -2964,9 +2959,7 @@ async function renderAIHubMixImage(ctx: MediaContext, credentials: ProviderConfi
   if (entry.b64_json) {
     bytes = Buffer.from(entry.b64_json, 'base64');
   } else if (entry.url) {
-    const urlCheck = await assertExternalAssetUrl(entry.url);
-    if (!urlCheck.ok) throw new Error(urlCheck.error);
-    const imgResp = await fetch(entry.url, withMediaRequestInit(ctx));
+    const imgResp = await assertAndFetchExternalAsset(entry.url, withMediaRequestInit(ctx));
     if (!imgResp.ok) throw new Error(`aihubmix image fetch ${imgResp.status}`);
     bytes = Buffer.from(await imgResp.arrayBuffer());
   } else {
@@ -3167,19 +3160,19 @@ async function renderAIHubMixVideo(
 
   let bytes: Buffer;
   if (directUrl) {
-    const urlCheck = await assertExternalAssetUrl(directUrl);
-    if (!urlCheck.ok) throw new Error(urlCheck.error);
     // AIHubMix's completed-video URL is often an authenticated endpoint on the
     // AIHubMix origin (a bare GET returns 401). Re-send the Bearer + APP-Code
     // headers when the asset is same-origin; a signed third-party CDN URL is
-    // fetched without our key.
+    // fetched without our key. assertAndFetchExternalAsset re-validates the URL
+    // and pins `redirect: 'error'`, so a validated public URL can't 302 the
+    // daemon into private/metadata space or leak our headers to the hop target.
     let sameOriginAsBase = false;
     try {
       sameOriginAsBase = new URL(directUrl).origin === new URL(baseUrl).origin;
     } catch {
       sameOriginAsBase = false;
     }
-    const dl = await fetch(
+    const dl = await assertAndFetchExternalAsset(
       directUrl,
       withMediaRequestInit(
         ctx,

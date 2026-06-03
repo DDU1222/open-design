@@ -558,7 +558,7 @@ const API_KEY_CONSOLE_LINKS: Record<ApiProtocol, { host: string; url: string }> 
   },
   aihubmix: {
     host: 'aihubmix.com',
-    url: 'https://aihubmix.com',
+    url: 'https://aihubmix.com/?aff=JA1e',
   },
 };
 

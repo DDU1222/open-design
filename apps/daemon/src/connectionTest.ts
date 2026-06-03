@@ -172,6 +172,27 @@ export async function assertExternalAssetUrl(
   return { ok: true };
 }
 
+/**
+ * Validate an upstream-controlled asset URL and fetch it with the SSRF guard
+ * pinned through redirects. Runs `assertExternalAssetUrl` on the literal URL
+ * and forces `redirect: 'error'`, so a validated public URL that 302s into
+ * loopback / RFC1918 / metadata space is rejected before any bytes are read.
+ *
+ * Throws on a blocked host — so the redirect bypass is impossible to forget at
+ * call sites — and the platform fetch additionally throws when `redirect:
+ * 'error'` encounters a 3xx. Callers keep their own `!resp.ok` HTTP-status
+ * handling. The forced `redirect` is spread last so it overrides any value the
+ * caller passed in `init`.
+ */
+export async function assertAndFetchExternalAsset(
+  url: string,
+  init: RequestInit = {},
+): Promise<Response> {
+  const check = await assertExternalAssetUrl(url);
+  if (!check.ok) throw new Error(check.error);
+  return fetch(url, { ...init, redirect: 'error' });
+}
+
 // Aggressive but not punitive — happy paths usually return in under 2 s.
 // Override with OD_CONNECTION_TEST_PROVIDER_TIMEOUT_MS for slow networks
 // or distant providers; invalid values fall back to the default.

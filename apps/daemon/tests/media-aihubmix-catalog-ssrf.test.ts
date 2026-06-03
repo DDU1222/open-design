@@ -68,4 +68,31 @@ describe('aihubmix catalogue route SSRF guard', () => {
     expect(upstreamUrls[0]).toBe('https://aihubmix.com/api/v1/models?type=image_generation');
     expect(upstreamUrls[0]).not.toContain('169.254.169.254');
   });
+
+  it('rejects a cross-origin request and issues no upstream fetch', async () => {
+    const daemonUrl = await start();
+
+    const upstreamUrls: string[] = [];
+    vi.stubGlobal('fetch', (input: any, init?: any) => {
+      const u = String(typeof input === 'string' ? input : input?.url ?? input);
+      if (u.startsWith(daemonUrl)) return realFetch(input, init);
+      upstreamUrls.push(u);
+      return Promise.resolve(
+        new Response(JSON.stringify({ data: [] }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        }),
+      );
+    });
+
+    // A browser request carrying a foreign Origin must be turned away by the
+    // in-handler isLocalSameOrigin guard, like every sibling media route.
+    const resp = await realFetch(
+      `${daemonUrl}/api/media/providers/aihubmix/models?type=image_generation`,
+      { headers: { Origin: 'http://evil.example:1234' } },
+    );
+    expect(resp.status).toBe(403);
+    // Guard runs before any outbound fetch, so the daemon never reaches AIHubMix.
+    expect(upstreamUrls).toHaveLength(0);
+  });
 });
