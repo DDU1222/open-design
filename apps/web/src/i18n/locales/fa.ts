@@ -1384,6 +1384,12 @@ export const fa: Dict = {
   'qf.cardSelected': 'انتخاب شده',
   'qf.cardRefs': 'مراجع:',
   'qf.cardSampleText': 'روباه قهوه‌ای سریع · ۰۱۲۳',
+  'questions.tabLabel': 'Questions',
+  'questions.banner': 'Mind if I ask a couple of quick questions?',
+  'questions.continue': 'Continue',
+  'questions.generating': 'Generating questions…',
+  'questions.skipAll': 'Skip all',
+  'questions.autoSkipHint': 'Auto-continues when the timer ends',
 
   'fileViewer.deployToVercel': 'استقرار روی Vercel',
   'fileViewer.redeployToVercel': 'استقرار دوباره',

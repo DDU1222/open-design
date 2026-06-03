@@ -1390,6 +1390,12 @@ export const tr: Dict = {
   'qf.cardSelected': 'seçildi',
   'qf.cardRefs': 'Referanslar:',
   'qf.cardSampleText': 'Pijamalı hasta yağız şoföre çabucak güvendi · 0123',
+  'questions.tabLabel': 'Questions',
+  'questions.banner': 'Mind if I ask a couple of quick questions?',
+  'questions.continue': 'Continue',
+  'questions.generating': 'Generating questions…',
+  'questions.skipAll': 'Skip all',
+  'questions.autoSkipHint': 'Auto-continues when the timer ends',
 
   'sketch.toolSelect': 'Seç (işlem yok)',
   'sketch.toolPen': 'Kalem',

@@ -1403,6 +1403,12 @@ export const hu: Dict = {
   'qf.cardSelected': 'kiválasztva',
   'qf.cardRefs': 'Hivatkozások:',
   'qf.cardSampleText': 'Árvíztűrő tükörfúrógép · 0123',
+  'questions.tabLabel': 'Questions',
+  'questions.banner': 'Mind if I ask a couple of quick questions?',
+  'questions.continue': 'Continue',
+  'questions.generating': 'Generating questions…',
+  'questions.skipAll': 'Skip all',
+  'questions.autoSkipHint': 'Auto-continues when the timer ends',
 
   'sketch.toolSelect': 'Kijelölés (nem aktív)',
   'sketch.toolPen': 'Toll',

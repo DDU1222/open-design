@@ -1549,6 +1549,12 @@ export const id: Dict = {
   'qf.cardSelected': 'Dipilih',
   'qf.cardRefs': 'Referensi',
   'qf.cardSampleText': 'Contoh teks',
+  'questions.tabLabel': 'Questions',
+  'questions.banner': 'Mind if I ask a couple of quick questions?',
+  'questions.continue': 'Continue',
+  'questions.generating': 'Generating questions…',
+  'questions.skipAll': 'Skip all',
+  'questions.autoSkipHint': 'Auto-continues when the timer ends',
 
   'sketch.toolSelect': 'Pilih',
   'sketch.toolPen': 'Pena',

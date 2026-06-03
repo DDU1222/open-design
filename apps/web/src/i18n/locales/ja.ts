@@ -1290,6 +1290,12 @@ export const ja: Dict = {
   'qf.cardSelected': '選択済み',
   'qf.cardRefs': '参照:',
   'qf.cardSampleText': 'The quick brown fox · 0123',
+  'questions.tabLabel': 'Questions',
+  'questions.banner': 'Mind if I ask a couple of quick questions?',
+  'questions.continue': 'Continue',
+  'questions.generating': 'Generating questions…',
+  'questions.skipAll': 'Skip all',
+  'questions.autoSkipHint': 'Auto-continues when the timer ends',
 
   'sketch.toolSelect': '選択（操作なし）',
   'sketch.toolPen': 'ペン',

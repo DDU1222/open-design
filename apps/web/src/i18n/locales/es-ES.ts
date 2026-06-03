@@ -1292,6 +1292,12 @@ export const esES: Dict = {
   'qf.cardSelected': 'seleccionado',
   'qf.cardRefs': 'Refs:',
   'qf.cardSampleText': 'El veloz murciélago hindú · 0123',
+  'questions.tabLabel': 'Questions',
+  'questions.banner': 'Mind if I ask a couple of quick questions?',
+  'questions.continue': 'Continue',
+  'questions.generating': 'Generating questions…',
+  'questions.skipAll': 'Skip all',
+  'questions.autoSkipHint': 'Auto-continues when the timer ends',
 
   'sketch.toolSelect': 'Seleccionar (sin acción)',
   'sketch.toolPen': 'Lápiz',

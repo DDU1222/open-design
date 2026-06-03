@@ -1403,6 +1403,12 @@ export const ar: Dict = {
   'qf.cardSelected': 'محدد',
   'qf.cardRefs': 'المراجع:',
   'qf.cardSampleText': 'The quick brown fox · 0123',
+  'questions.tabLabel': 'Questions',
+  'questions.banner': 'Mind if I ask a couple of quick questions?',
+  'questions.continue': 'Continue',
+  'questions.generating': 'Generating questions…',
+  'questions.skipAll': 'Skip all',
+  'questions.autoSkipHint': 'Auto-continues when the timer ends',
 
   'sketch.toolSelect': 'تحديد (لا إجراء)',
   'sketch.toolPen': 'قلم',

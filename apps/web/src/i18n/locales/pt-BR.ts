@@ -1444,6 +1444,12 @@ export const ptBR: Dict = {
   'qf.cardSelected': 'selecionado',
   'qf.cardRefs': 'Refs:',
   'qf.cardSampleText': 'A rápida raposa marrom · 0123',
+  'questions.tabLabel': 'Questions',
+  'questions.banner': 'Mind if I ask a couple of quick questions?',
+  'questions.continue': 'Continue',
+  'questions.generating': 'Generating questions…',
+  'questions.skipAll': 'Skip all',
+  'questions.autoSkipHint': 'Auto-continues when the timer ends',
 
   'sketch.toolSelect': 'Selecionar (sem ação)',
   'sketch.toolPen': 'Caneta',

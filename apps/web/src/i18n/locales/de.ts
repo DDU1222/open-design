@@ -1291,6 +1291,12 @@ export const de: Dict = {
   'qf.cardSelected': 'ausgewählt',
   'qf.cardRefs': 'Refs:',
   'qf.cardSampleText': 'Franz jagt im komplett verwahrlosten Taxi quer durch Bayern · 0123',
+  'questions.tabLabel': 'Questions',
+  'questions.banner': 'Mind if I ask a couple of quick questions?',
+  'questions.continue': 'Continue',
+  'questions.generating': 'Generating questions…',
+  'questions.skipAll': 'Skip all',
+  'questions.autoSkipHint': 'Auto-continues when the timer ends',
 
   'sketch.toolSelect': 'Auswählen (no-op)',
   'sketch.toolPen': 'Stift',

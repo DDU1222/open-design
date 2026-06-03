@@ -1361,6 +1361,12 @@ export const th: Dict = {
   'qf.cardSelected': 'เลือกใช้งาน',
   'qf.cardRefs': 'เชื่อมโยงจากตัวของ:',
   'qf.cardSampleText': 'สุนัขจิ้งจอกสีน้ำตาลตัวรวดเร็ว · 0123',
+  'questions.tabLabel': 'Questions',
+  'questions.banner': 'Mind if I ask a couple of quick questions?',
+  'questions.continue': 'Continue',
+  'questions.generating': 'Generating questions…',
+  'questions.skipAll': 'Skip all',
+  'questions.autoSkipHint': 'Auto-continues when the timer ends',
 
   'sketch.toolSelect': 'จิ้มเลือกตัวสิ่งของ',
   'sketch.toolPen': 'ปากกาวาดลาย',

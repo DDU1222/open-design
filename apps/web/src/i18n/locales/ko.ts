@@ -1403,6 +1403,12 @@ export const ko: Dict = {
   'qf.cardSelected': '선택됨',
   'qf.cardRefs': '참조:',
   'qf.cardSampleText': '다람쥐 헌 쳇바퀴에 타고파 · 0123',
+  'questions.tabLabel': 'Questions',
+  'questions.banner': 'Mind if I ask a couple of quick questions?',
+  'questions.continue': 'Continue',
+  'questions.generating': 'Generating questions…',
+  'questions.skipAll': 'Skip all',
+  'questions.autoSkipHint': 'Auto-continues when the timer ends',
 
   'sketch.toolSelect': '선택',
   'sketch.toolPen': '펜',

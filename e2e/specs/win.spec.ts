@@ -340,7 +340,7 @@ winDescribe('packaged windows runtime smoke', () => {
   let installed = false;
   let started = false;
 
-  test('installs, starts, inspects with eval and screenshot, stops, and uninstalls the built windows artifact', async () => {
+  test('[P2] installs, starts, inspects with eval and screenshot, stops, and uninstalls the built windows artifact', async () => {
     const report = await createPackagedSmokeReport('win');
     const updateEnv = captureUpdateEnv();
     let updaterFixture: UpdaterFixtureProcess | null = null;

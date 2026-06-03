@@ -1632,6 +1632,12 @@ export const zhTW: Dict = {
   'qf.cardSelected': '已選',
   'qf.cardRefs': '參考：',
   'qf.cardSampleText': '飛燕環宇 · 0123',
+  'questions.tabLabel': 'Questions',
+  'questions.banner': 'Mind if I ask a couple of quick questions?',
+  'questions.continue': 'Continue',
+  'questions.generating': 'Generating questions…',
+  'questions.skipAll': 'Skip all',
+  'questions.autoSkipHint': 'Auto-continues when the timer ends',
 
   'sketch.toolSelect': '選擇（佔位）',
   'sketch.toolPen': '鋼筆',
