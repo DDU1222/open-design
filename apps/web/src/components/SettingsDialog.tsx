@@ -328,18 +328,19 @@ function hidesAccountModelSourceLabel(protocol: ApiProtocol): boolean {
   return ACCOUNT_MODEL_SOURCE_LABEL_HIDDEN.has(protocol);
 }
 
-// Single-origin gateways expose exactly one preset, so the "gateway preset"
-// dropdown only ever offers that one entry (plus the generic custom-endpoint
-// escape hatch) — redundant noise. Hide it for these protocols; the Base URL
-// field still shows the resolved origin. Add a protocol here when it's a
-// fixed-origin gateway with a single preset. (Other single-provider protocols
-// like azure keep the picker because they rely on its custom-endpoint path.)
-const GATEWAY_PRESET_HIDDEN = new Set<ApiProtocol>([
+// Fixed-origin gateways: a single managed endpoint where the user configures
+// nothing but the API key. Both the "gateway preset" dropdown (only ever one
+// entry + the custom escape hatch) and the editable Base URL field are
+// redundant noise for these, so we hide both — the resolved origin is filled in
+// automatically on protocol switch. Add a protocol here when it's such a
+// gateway. (Other single-provider protocols like azure are NOT listed: they
+// rely on the preset's custom-endpoint path and a user-entered Base URL.)
+const FIXED_ORIGIN_GATEWAYS = new Set<ApiProtocol>([
   'aihubmix',
 ]);
 
-function hidesGatewayPreset(protocol: ApiProtocol): boolean {
-  return GATEWAY_PRESET_HIDDEN.has(protocol);
+function isFixedOriginGateway(protocol: ApiProtocol): boolean {
+  return FIXED_ORIGIN_GATEWAYS.has(protocol);
 }
 
 type ProviderModelsState =
@@ -2244,7 +2245,10 @@ export function SettingsDialog({
         );
   const selectedProvider = selectedProviderIndex >= 0 ? protocolProviders[selectedProviderIndex] : undefined;
   const showProviderPreset =
-    protocolProviders.length > 0 && !hidesGatewayPreset(apiProtocol);
+    protocolProviders.length > 0 && !isFixedOriginGateway(apiProtocol);
+  // Fixed-origin gateways resolve their Base URL automatically; nothing for the
+  // user to edit, so hide the field entirely.
+  const showBaseUrlField = !isFixedOriginGateway(apiProtocol);
   const byokRequiresApiKey = byokProviderRequiresApiKey(
     apiProtocol,
     selectedProvider,
@@ -3935,41 +3939,43 @@ export function SettingsDialog({
                 }}
                 onToggleShowApiKey={() => setShowApiKey((v) => !v)}
               />
-              <ByokProviderBaseUrl
-                apiProtocol={apiProtocol}
-                inputRef={baseUrlInputRef}
-                baseUrl={cfg.baseUrl}
-                baseUrlError={baseUrlErrorMessage}
-                baseUrlInvalid={Boolean(baseUrlErrorMessage)}
-                baseUrlPlaceholder={baseUrlPlaceholder}
-                baseUrlReadOnly={baseUrlReadOnly}
-                labels={{
-                  baseUrl: t('settings.baseUrl'),
-                  required: t('settings.required'),
-                  customize: t('settings.baseUrlCustomize'),
-                  invalid: t('settings.baseUrlInvalid'),
-                  defaultHint: t('settings.baseUrlDefaultHint'),
-                  azureHint: t('settings.azureBaseUrlHint'),
-                }}
-                onBlur={commitProviderModelsInputs}
-                onChange={(value) => updateApiConfig({ baseUrl: value, apiProviderBaseUrl: null })}
-                onCustomize={() => {
-                  updateApiConfig({ apiProviderBaseUrl: null });
-                  window.setTimeout(() => baseUrlInputRef.current?.focus(), 0);
-                }}
-                onFocus={() => {
-                  const byokProviderId = byokProtocolToTracking(apiProtocol);
-                  if (byokProviderId) {
-                    trackSettingsByokFieldClick(analytics.track, {
-                      page_name: 'settings',
-                      area: 'configure_execution_mode_byok',
-                      element: 'base_url',
-                      provider_id: byokProviderId,
-                      has_value: Boolean(cfg.baseUrl?.trim()),
-                    });
-                  }
-                }}
-              />
+              {showBaseUrlField ? (
+                <ByokProviderBaseUrl
+                  apiProtocol={apiProtocol}
+                  inputRef={baseUrlInputRef}
+                  baseUrl={cfg.baseUrl}
+                  baseUrlError={baseUrlErrorMessage}
+                  baseUrlInvalid={Boolean(baseUrlErrorMessage)}
+                  baseUrlPlaceholder={baseUrlPlaceholder}
+                  baseUrlReadOnly={baseUrlReadOnly}
+                  labels={{
+                    baseUrl: t('settings.baseUrl'),
+                    required: t('settings.required'),
+                    customize: t('settings.baseUrlCustomize'),
+                    invalid: t('settings.baseUrlInvalid'),
+                    defaultHint: t('settings.baseUrlDefaultHint'),
+                    azureHint: t('settings.azureBaseUrlHint'),
+                  }}
+                  onBlur={commitProviderModelsInputs}
+                  onChange={(value) => updateApiConfig({ baseUrl: value, apiProviderBaseUrl: null })}
+                  onCustomize={() => {
+                    updateApiConfig({ apiProviderBaseUrl: null });
+                    window.setTimeout(() => baseUrlInputRef.current?.focus(), 0);
+                  }}
+                  onFocus={() => {
+                    const byokProviderId = byokProtocolToTracking(apiProtocol);
+                    if (byokProviderId) {
+                      trackSettingsByokFieldClick(analytics.track, {
+                        page_name: 'settings',
+                        area: 'configure_execution_mode_byok',
+                        element: 'base_url',
+                        provider_id: byokProviderId,
+                        has_value: Boolean(cfg.baseUrl?.trim()),
+                      });
+                    }
+                  }}
+                />
+              ) : null}
               <ByokModelField
                 customActive={apiModelCustomActive}
                 customInputRef={customModelInputRef}
