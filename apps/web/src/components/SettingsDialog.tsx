@@ -328,6 +328,20 @@ function hidesAccountModelSourceLabel(protocol: ApiProtocol): boolean {
   return ACCOUNT_MODEL_SOURCE_LABEL_HIDDEN.has(protocol);
 }
 
+// Single-origin gateways expose exactly one preset, so the "gateway preset"
+// dropdown only ever offers that one entry (plus the generic custom-endpoint
+// escape hatch) — redundant noise. Hide it for these protocols; the Base URL
+// field still shows the resolved origin. Add a protocol here when it's a
+// fixed-origin gateway with a single preset. (Other single-provider protocols
+// like azure keep the picker because they rely on its custom-endpoint path.)
+const GATEWAY_PRESET_HIDDEN = new Set<ApiProtocol>([
+  'aihubmix',
+]);
+
+function hidesGatewayPreset(protocol: ApiProtocol): boolean {
+  return GATEWAY_PRESET_HIDDEN.has(protocol);
+}
+
 type ProviderModelsState =
   | { status: 'idle' }
   | { status: 'running'; cacheKey: string }
@@ -2230,7 +2244,7 @@ export function SettingsDialog({
         );
   const selectedProvider = selectedProviderIndex >= 0 ? protocolProviders[selectedProviderIndex] : undefined;
   const showProviderPreset =
-    protocolProviders.length > 0;
+    protocolProviders.length > 0 && !hidesGatewayPreset(apiProtocol);
   const byokRequiresApiKey = byokProviderRequiresApiKey(
     apiProtocol,
     selectedProvider,
