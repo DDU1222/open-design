@@ -7,6 +7,8 @@ import {
   normalizeModelId,
   snapDuration,
   snapResolutionToken,
+  snapVeoSize,
+  snapSizeToSupported,
   aihubmixMediaRegistry,
   type ModelCapability,
 } from '../src/media-adapters/index.js';
@@ -23,9 +25,19 @@ const VEO: ModelCapability = {
   id: 'veo-3.1-generate-preview',
   apiModel: 'veo-3.1-generate-preview',
   mediaType: 'video',
+  family: 'veo',
+  caps: ['t2v'], // veo is text-to-video only on the AIHubMix gateway
+  supportedDurations: [4, 6, 8],
+};
+
+const SORA: ModelCapability = {
+  id: 'sora-2',
+  apiModel: 'sora-2',
+  mediaType: 'video',
   family: 'generic',
   caps: ['t2v', 'i2v'],
-  supportedDurations: [4, 6, 8],
+  supportedDurations: [4, 8, 12],
+  supportedSizes: ['720x1280', '1280x720'],
 };
 
 const DATA_URL = 'data:image/png;base64,aGVsbG8=';
@@ -41,16 +53,19 @@ describe('media-adapters registry', () => {
   it('default registry is seeded with known video models', () => {
     expect(aihubmixMediaRegistry.get('doubao-seedance-2-0-260128')?.family).toBe('seedance');
     expect(aihubmixMediaRegistry.get('sora-2')?.family).toBe('generic');
+    expect(aihubmixMediaRegistry.get('veo-3.1-generate-preview')?.family).toBe('veo');
+    expect(aihubmixMediaRegistry.get('veo-3.1-lite-generate-preview')?.family).toBe('veo');
   });
 });
 
 describe('deriveVideoFamily', () => {
-  it('routes seedance / wan / generic by wire name', () => {
+  it('routes seedance / wan / veo / generic by wire name', () => {
     expect(deriveVideoFamily('doubao-seedance-2-0-260128')).toBe('seedance');
     expect(deriveVideoFamily('wan2.5-i2v-preview')).toBe('wan');
     expect(deriveVideoFamily('happyhorse-1.0-i2v')).toBe('wan');
+    expect(deriveVideoFamily('veo-3.1-generate-preview')).toBe('veo');
+    expect(deriveVideoFamily('veo-3.1-lite-generate-preview')).toBe('veo');
     expect(deriveVideoFamily('sora-2')).toBe('generic');
-    expect(deriveVideoFamily('veo-3.1-generate-preview')).toBe('generic');
   });
 });
 
@@ -113,6 +128,45 @@ describe('buildVideoRequest — seedance family', () => {
       size: '1280x720',
     });
     expect(built.body.resolution).toBe('1080p');
+  });
+});
+
+describe('snapVeoSize', () => {
+  it('passes through known-good Veo sizes', () => {
+    expect(snapVeoSize('1280x720')).toBe('1280x720');
+    expect(snapVeoSize('720x1280')).toBe('720x1280');
+    expect(snapVeoSize('1920x1080')).toBe('1920x1080');
+  });
+  it('maps out-of-range sizes to the nearest orientation at 720p', () => {
+    expect(snapVeoSize('1024x1024')).toBe('1280x720'); // square → landscape
+    expect(snapVeoSize('960x720')).toBe('1280x720'); // 4:3 → landscape
+    expect(snapVeoSize('720x960')).toBe('720x1280'); // 3:4 → portrait
+  });
+  it('defaults to landscape 720p when nothing usable is supplied', () => {
+    expect(snapVeoSize(undefined)).toBe('1280x720');
+    expect(snapVeoSize('garbage')).toBe('1280x720');
+  });
+});
+
+describe('snapSizeToSupported', () => {
+  const SUP = ['720x1280', '1280x720'];
+  it('returns the size unchanged when the model declares no constraint', () => {
+    expect(snapSizeToSupported('1024x1024', undefined)).toBe('1024x1024');
+    expect(snapSizeToSupported('1024x1024', [])).toBe('1024x1024');
+  });
+  it('passes through an exact supported value (case/×-insensitive)', () => {
+    expect(snapSizeToSupported('1280x720', SUP)).toBe('1280x720');
+    expect(snapSizeToSupported('1280X720', SUP)).toBe('1280x720');
+    expect(snapSizeToSupported('720×1280', SUP)).toBe('720x1280');
+  });
+  it('maps an unsupported size to a supported one of the same orientation', () => {
+    expect(snapSizeToSupported('1024x1024', SUP)).toBe('1280x720'); // square → landscape
+    expect(snapSizeToSupported('960x720', SUP)).toBe('1280x720'); // 4:3 landscape
+    expect(snapSizeToSupported('720x960', SUP)).toBe('720x1280'); // 3:4 portrait
+  });
+  it('falls back to the first supported size when input is missing/unparseable', () => {
+    expect(snapSizeToSupported(undefined, SUP)).toBe('1280x720');
+    expect(snapSizeToSupported('garbage', SUP)).toBe('1280x720');
   });
 });
 
@@ -192,34 +246,100 @@ describe('buildVideoRequest — wan family (happyhorse / wan*)', () => {
   });
 });
 
-describe('buildVideoRequest — generic family', () => {
-  it('t2v: flat body with seconds string + size, no input_reference', () => {
+describe('buildVideoRequest — veo family', () => {
+  it('t2v: seconds is a NUMBER and size only — no aspect_ratio (Gemini shim 400s otherwise)', () => {
+    // Regression: the chat video tool always derives an aspect-based size AND an
+    // aspect_ratio, and the generic branch sent seconds as the string "8". The
+    // gateway's OpenAI→Gemini predictLongRunning shim wants an integer and only
+    // honours `size`; the string + extra aspect_ratio made veo fail.
     const built = buildVideoRequest(VEO, {
       prompt: 'a sunset',
       durationSeconds: 5, // veo → snapped to 4
       aspectRatio: '16:9',
       size: '1280x720',
     });
-    expect(built.family).toBe('generic');
+    expect(built.family).toBe('veo');
     expect(built.body).toMatchObject({
       model: 'veo-3.1-generate-preview',
       prompt: 'a sunset',
-      seconds: '4',
-      aspect_ratio: '16:9',
+      seconds: 4, // NUMBER, not "4"
       size: '1280x720',
     });
+    expect(typeof built.body.seconds).toBe('number');
+    expect(built.body.aspect_ratio).toBeUndefined();
+    expect(built.body.resolution).toBeUndefined(); // never an explicit resolution
     expect(built.body.input_reference).toBeUndefined();
   });
 
-  it('i2v: attaches input_reference as the data URL', () => {
+  it('snaps an out-of-range size (1:1) to a valid landscape Veo size (Gemini shim 400s on 1024p)', () => {
+    const built = buildVideoRequest(VEO, {
+      prompt: 'square clip',
+      durationSeconds: 8,
+      size: '1024x1024', // 1:1 → gateway would derive an invalid 1024p
+    });
+    expect(built.body.size).toBe('1280x720');
+  });
+
+  it('t2v-only: never emits input_reference even if a reference image is passed', () => {
+    // veo rejects every reference form on the gateway; the builder must not put
+    // one on the wire. (The caller gates i2v out via caps before reaching here.)
     const built = buildVideoRequest(VEO, {
       prompt: 'clip',
       durationSeconds: 6,
       imageRef: { dataUrl: DATA_URL },
     });
+    expect(built.body.input_reference).toBeUndefined();
+    expect(built.body.seconds).toBe(6);
+  });
+});
+
+describe('buildVideoRequest — generic family (sora)', () => {
+  it('t2v: flat body with seconds string + size, NO aspect_ratio (Sora rejects it), no input_reference', () => {
+    const built = buildVideoRequest(SORA, {
+      prompt: 'a sunset',
+      durationSeconds: 5, // sora 4/8/12 → snapped to 4
+      aspectRatio: '16:9', // supplied by the caller but must NOT reach the wire
+      size: '1280x720',
+    });
+    expect(built.family).toBe('generic');
+    expect(built.body).toMatchObject({
+      model: 'sora-2',
+      prompt: 'a sunset',
+      seconds: '4', // generic keeps the string shape sora expects
+      size: '1280x720',
+    });
+    // Regression: Sora 400s with "Unknown parameter: 'aspect_ratio'".
+    expect(built.body.aspect_ratio).toBeUndefined();
+    expect(built.body.input_reference).toBeUndefined();
+  });
+
+  it('snaps an unsupported size (1:1) to a supported one (Sora 400s on 1024x1024)', () => {
+    const built = buildVideoRequest(SORA, {
+      prompt: 'square',
+      durationSeconds: 8,
+      size: '1024x1024', // not in Sora's supported set
+    });
+    expect(built.body.size).toBe('1280x720'); // square → landscape
+  });
+
+  it('snaps a portrait-ish size to the supported portrait size', () => {
+    const built = buildVideoRequest(SORA, {
+      prompt: 'tall',
+      durationSeconds: 8,
+      size: '720x960', // 3:4 portrait, unsupported
+    });
+    expect(built.body.size).toBe('720x1280');
+  });
+
+  it('i2v: attaches input_reference as the data URL', () => {
+    const built = buildVideoRequest(SORA, {
+      prompt: 'clip',
+      durationSeconds: 8,
+      imageRef: { dataUrl: DATA_URL },
+    });
     expect(built.hasReference).toBe(true);
     expect(built.body.input_reference).toBe(DATA_URL);
-    expect(built.body.seconds).toBe('6');
+    expect(built.body.seconds).toBe('8');
   });
 });
 

@@ -85,14 +85,27 @@ export const AIHUBMIX_VIDEO_SEED: ModelCapability[] = [
     supportedDurations: [4, 8, 12],
   },
 
-  // ── Google Veo — generic; Veo only accepts 4/6/8 seconds ─────────────────
+  // ── Google Veo — own `veo` family (Gemini predictLongRunning shim) ───────
+  // TEXT-TO-VIDEO ONLY on the AIHubMix gateway — verified by probing both
+  // variants with a reference image in every accepted form (data URL, public
+  // URL, {image_url} object): the shim 400s with "`inlineData`/`referenceImages`
+  // isn't supported by this model". So no i2v cap and no frame images for any
+  // veo here. Working t2v call: flat body, seconds as a NUMBER, `size` only (no
+  // aspect_ratio/resolution). Veo only accepts 4/6/8 seconds.
   {
     id: 'veo-3.1-generate-preview',
     apiModel: 'veo-3.1-generate-preview',
     mediaType: 'video',
-    family: 'generic',
-    caps: ['t2v', 'i2v'],
-    supportedFrameImages: ['first_frame'],
+    family: 'veo',
+    caps: ['t2v'],
+    supportedDurations: [4, 6, 8],
+  },
+  {
+    id: 'veo-3.1-lite-generate-preview',
+    apiModel: 'veo-3.1-lite-generate-preview',
+    mediaType: 'video',
+    family: 'veo',
+    caps: ['t2v'],
     supportedDurations: [4, 6, 8],
   },
 

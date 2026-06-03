@@ -18,9 +18,13 @@
  *   • `seedance` — multimodal `content[]` array (ByteDance Ark).
  *   • `wan` — Alibaba DashScope/wanx wire: `{ input:{ prompt, media[] }, parameters:{ resolution, duration, … } }`.
  *     Covers wan* and happyhorse* (both proxied to DashScope by the gateway).
- *   • `generic` — flat JSON `{ prompt, seconds, input_reference }` (sora/veo/…).
+ *   • `veo` — Google Veo via the Gemini `predictLongRunning` link. Flat JSON, but
+ *     `seconds` MUST be a NUMBER and the only size hint is `size` (no `aspect_ratio`).
+ *     Reference image rides as `input_reference`. Verified against a working
+ *     veo-3.1-lite-generate-preview call.
+ *   • `generic` — flat JSON `{ prompt, seconds (string), input_reference }` (sora/…).
  */
-export type MediaFamily = 'seedance' | 'wan' | 'generic';
+export type MediaFamily = 'seedance' | 'wan' | 'veo' | 'generic';
 
 export type MediaType = 'video' | 'image' | 'audio';
 

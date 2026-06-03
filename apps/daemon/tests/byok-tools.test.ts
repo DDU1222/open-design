@@ -1234,9 +1234,11 @@ describe('executeAIHubMixGenerateVideo', () => {
   // Per-family duration snapping (regression: Veo 400 "durationSeconds out of
   // bound" because AIHubMix's unified `seconds` only takes 4/6/8 for Veo).
   it.each([
-    ['aihubmix-veo-3.1-lite-generate-preview', 5, '4'], // veo 4/6/8, 5→nearest (tie→shorter)
-    ['aihubmix-veo-3.1-lite-generate-preview', 7, '6'], // veo, 7→6 (tie→shorter)
-    ['aihubmix-veo-3.1-lite-generate-preview', 10, '8'], // veo, clamp to 8
+    // veo family sends seconds as a NUMBER (Gemini predictLongRunning shim);
+    // sora (generic family) keeps the string shape it expects.
+    ['aihubmix-veo-3.1-lite-generate-preview', 5, 4], // veo 4/6/8, 5→nearest (tie→shorter)
+    ['aihubmix-veo-3.1-lite-generate-preview', 7, 6], // veo, 7→6 (tie→shorter)
+    ['aihubmix-veo-3.1-lite-generate-preview', 10, 8], // veo, clamp to 8
     ['aihubmix-sora-2', 5, '4'], // sora 4/8/12
     ['aihubmix-sora-2', 11, '12'], // sora, 11→12
     // (seedance uses `duration` not `seconds` — covered by media-adapters.test)
@@ -1397,6 +1399,31 @@ describe('executeAIHubMixGenerateVideo', () => {
     );
     expect(result.ok).toBe(true);
     expect(submitBody.input_reference).toBeUndefined();
+  });
+
+  // Regression: the Gemini predictLongRunning shim 400s with
+  // "`inlineData`/`referenceImages` isn't supported by this model" when ANY veo
+  // variant is handed a reference (verified by probing data-URL/public-URL/object
+  // forms against both). We catch it before the upstream call and tell the user
+  // how to recover. Veo is text-to-video only here — including the non-lite one.
+  it.each([
+    'aihubmix-veo-3.1-lite-generate-preview',
+    'aihubmix-veo-3.1-generate-preview',
+  ])('veo (t2v-only): %s rejects a reference image with an actionable error, no upstream call', async (model) => {
+    const refDir = path.join(projectsRoot, PROJECT_ID);
+    await mkdir(refDir, { recursive: true });
+    await writeFile(path.join(refDir, 'ref.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await executeAIHubMixGenerateVideo(
+      { prompt: 'animate this', model, image_url: '/api/projects/test-project/files/ref.png' },
+      baseCtx(),
+    );
+    expect(result.ok).toBe(false);
+    expect(result.error).toMatch(/text-to-video model and can't take a reference image/);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('returns { ok: false } when no API key is available, before any fetch', async () => {

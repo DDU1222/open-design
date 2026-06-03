@@ -1410,20 +1410,24 @@ function aihubmixVideoCapabilityFor(catalogModel: string): ModelCapability {
   if (existing) return existing;
   const wire = aihubmixWireModel(catalogModel);
   const lower = wire.toLowerCase();
-  const supportedDurations = lower.startsWith('veo')
+  const isVeo = lower.startsWith('veo');
+  const supportedDurations = isVeo
     ? [4, 6, 8]
     : lower.startsWith('sora')
       ? [4, 8, 12]
       : lower.startsWith('wan')
         ? [5, 10]
         : undefined;
+  // Veo is text-to-video only on the gateway (every reference form is rejected),
+  // so never grant it an i2v cap even if a future wire name contained "i2v".
+  const i2v = !isVeo && lower.includes('i2v');
   return {
     id: wire,
     apiModel: wire,
     mediaType: 'video',
     family: deriveVideoFamily(wire),
-    caps: lower.includes('i2v') ? ['i2v'] : ['t2v'],
-    supportedFrameImages: ['first_frame'],
+    caps: i2v ? ['i2v'] : ['t2v'],
+    ...(i2v ? { supportedFrameImages: ['first_frame'] } : {}),
     ...(supportedDurations ? { supportedDurations } : {}),
   };
 }
@@ -1481,20 +1485,30 @@ export async function executeAIHubMixGenerateVideo(
   if (!apiKey) return { ok: false, error: 'no AIHubMix API key available' };
   const trimmedBase = baseUrl.replace(/\/+$/, '');
 
-  // Image-to-video reference: i2v models (id contains "i2v") animate a first
-  // frame and FAIL ("Video generation failed") without one. Prefer the explicit
-  // image_url; for i2v fall back to the newest project image so the common
-  // "animate the image I just made/uploaded" flow works without the LLM having
-  // to thread a URL. t2v models ignore any reference.
-  const isI2V = wireModel.toLowerCase().includes('i2v');
+  // Resolve the capability up front so reference-image handling can key off the
+  // model's declared caps rather than a name heuristic. Phase 1 uses the ported
+  // aihubmix-video seed; Phase 2 swaps the registry to a live /api/v1/models fetch.
+  const cap = aihubmixVideoCapabilityFor(catalogModel);
+
+  // Image-to-video reference handling, split into two independent properties:
+  //   • requiresReference — i2v-ONLY models (name contains "i2v", e.g.
+  //     wan2.7-i2v / happyhorse-1.0-i2v) FAIL without a first frame, so we
+  //     auto-grab the newest project image when none was passed.
+  //   • acceptsReference — whether sending a reference is allowed AT ALL
+  //     (cap.caps includes 'i2v'). veo-3.1-lite is text-to-video only and the
+  //     Gemini shim 400s on a reference ("`referenceImages` isn't supported");
+  //     veo-3.1-generate-preview keeps i2v. t2v-dual models (seedance/sora/veo)
+  //     accept an optional reference but never require one.
+  const requiresReference = wireModel.toLowerCase().includes('i2v');
+  const acceptsReference = cap.caps.includes('i2v');
   let refImage = await resolveAIHubMixReferenceImage(args.image_url, dir, ctx);
-  if (!refImage && isI2V) {
+  if (!refImage && requiresReference) {
     refImage = await newestProjectImagePart(dir);
     if (refImage) {
       console.log('[proxy:aihubmix] generate_video i2v: no image_url; using newest project image as reference');
     }
   }
-  if (isI2V && !refImage) {
+  if (requiresReference && !refImage) {
     return {
       ok: false,
       error:
@@ -1503,12 +1517,15 @@ export async function executeAIHubMixGenerateVideo(
         + 'or switch to a text-to-video model.',
     };
   }
-
-  // Build the upstream request via the shared media-adapters layer (family-aware:
-  // seedance → multimodal content[] array, others → flat input_reference, with
-  // per-family duration snapping). Phase 1 uses the ported aihubmix-video seed;
-  // Phase 2 swaps the registry to a live AIHubMix /api/v1/models fetch.
-  const cap = aihubmixVideoCapabilityFor(catalogModel);
+  if (refImage && !acceptsReference) {
+    return {
+      ok: false,
+      error:
+        `${wireModel} is a text-to-video model and can't take a reference image. `
+        + 'Remove the image, or switch to an image-to-video model '
+        + '(e.g. wan2.7-i2v or doubao-seedance-2-0-260128).',
+    };
+  }
   const refDataUrl = refImage
     ? `data:${refImage.mime};base64,${refImage.bytes.toString('base64')}`
     : undefined;

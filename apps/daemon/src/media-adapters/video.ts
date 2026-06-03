@@ -5,8 +5,12 @@
 //     `content[]` array (text + image_url{url,role:first_frame}); duration/ratio/resolution.
 //   • wan (wan* / happyhorse* — both DashScope/wanx-backed on the gateway) →
 //     { model, input:{ prompt, media:[{type:first_frame,url}] }, parameters:{ resolution, duration, prompt_extend, watermark } }.
-//   • generic (sora / veo / …) → flat JSON
-//     { model, prompt, seconds, aspect_ratio?, size?, input_reference? } with the
+//   • veo (veo* — Google Veo via the Gemini predictLongRunning link) → flat JSON
+//     { model, prompt, seconds (NUMBER), size?, input_reference? }. The gateway's
+//     OpenAI→Gemini shim wants seconds as an integer and only honours `size`;
+//     sending the string "8" or an extra `aspect_ratio` makes it fail.
+//   • generic (sora / …) → flat JSON
+//     { model, prompt, seconds (string), aspect_ratio?, size?, input_reference? } with the
 //     reference image as a data URL.
 // The caller resolves the reference image to a data URL beforehand and attaches
 // auth + base URL afterward; this module only shapes the body.
@@ -32,6 +36,11 @@ export function deriveVideoFamily(wireModel: string, cap?: ModelCapability): Med
   // the input.media + parameters wire shape (verified against a working
   // happyhorse-1.0-i2v call). Route them through the `wan` family.
   if (m.startsWith('wan') || m.startsWith('happyhorse')) return 'wan';
+  // veo* goes through the gateway's OpenAI→Gemini predictLongRunning shim, which
+  // wants seconds as a NUMBER and only `size` (no aspect_ratio). Its own family
+  // so it doesn't inherit generic's string-seconds shape (verified against a
+  // working veo-3.1-lite-generate-preview call).
+  if (m.startsWith('veo')) return 'veo';
   return 'generic';
 }
 
@@ -76,6 +85,50 @@ export function snapResolutionToken(
     return '1080p';
   }
   return '720p';
+}
+
+/**
+ * Veo (via the gateway's Gemini predictLongRunning shim) only accepts a handful
+ * of `size` values — the gateway derives `resolution` from `size`, and anything
+ * that maps outside 720p/1080p (e.g. a 1:1 `1024x1024`) 400s with
+ * "The string value `1024p` for `resolution` is invalid". Snap whatever the
+ * caller hands us to the nearest valid Veo size by orientation; default to
+ * landscape 720p. Known-good sizes pass through untouched.
+ */
+const VEO_VALID_SIZES = new Set(['1280x720', '720x1280', '1920x1080', '1080x1920']);
+export function snapVeoSize(size: string | undefined): string {
+  const s = (size || '').trim().toLowerCase().replace('×', 'x');
+  if (VEO_VALID_SIZES.has(s)) return s;
+  const m = /^(\d+)\s*x\s*(\d+)$/.exec(s);
+  if (m) return parseInt(m[2]!, 10) > parseInt(m[1]!, 10) ? '720x1280' : '1280x720';
+  return '1280x720';
+}
+
+/**
+ * Snap a requested `size` to the model's declared `supportedSizes` by
+ * orientation. Sora 400s on an unsupported size (e.g. a 1:1 `1024x1024` —
+ * "Supported values are: '720x1280','1280x720',…"), so a caller-derived size
+ * that isn't on the list is mapped to a supported one of the same orientation
+ * (portrait↔portrait, else landscape). Returns the size unchanged when the
+ * model declares no constraint; falls back to the first supported size when the
+ * input is missing/unparseable.
+ */
+export function snapSizeToSupported(
+  size: string | undefined,
+  supported: string[] | undefined,
+): string | undefined {
+  if (!supported || supported.length === 0) return size;
+  const norm = (v: string) => v.trim().toLowerCase().replace('×', 'x');
+  const s = norm(size || '');
+  const exact = supported.find((v) => norm(v) === s);
+  if (exact) return exact;
+  const dims = /^(\d+)\s*x\s*(\d+)$/.exec(s);
+  const portrait = dims ? parseInt(dims[2]!, 10) > parseInt(dims[1]!, 10) : false;
+  const match = supported.find((v) => {
+    const m = /^(\d+)\s*x\s*(\d+)$/.exec(norm(v));
+    return m ? parseInt(m[2]!, 10) > parseInt(m[1]!, 10) === portrait : false;
+  });
+  return match || supported[0];
 }
 
 /** Apply extraBodyDefaults, then overlay caller passthrough filtered by the whitelist. */
@@ -159,14 +212,36 @@ export function buildVideoRequest(cap: ModelCapability, input: VideoBuildInput):
     if (input.aspectRatio) parameters.aspect_ratio = input.aspectRatio;
     if (typeof input.seed === 'number') parameters.seed = input.seed;
     body = { model: wireModel, input: wanInput, parameters };
+  } else if (family === 'veo') {
+    // Google Veo via the gateway's OpenAI→Gemini predictLongRunning shim. Unlike
+    // the generic branch, `seconds` MUST be a number and `size` is the only size
+    // hint it honours — sending the string "8" or an extra `aspect_ratio` makes
+    // it fail. TEXT-TO-VIDEO ONLY: every reference-image form (inlineData /
+    // referenceImages) is rejected by the shim, so we never attach one here —
+    // the caller gates i2v out via the capability's caps.
+    body = {
+      model: wireModel,
+      prompt: input.prompt,
+      seconds,
+      // Always a valid Veo size — the gateway derives resolution from it, so a
+      // 1:1/4:3 pixel string would 400 as an invalid resolution.
+      size: snapVeoSize(input.size),
+    };
+    if (typeof input.generateAudio === 'boolean') body.generate_audio = input.generateAudio;
+    if (typeof input.seed === 'number') body.seed = input.seed;
   } else {
+    // Generic OpenAI-style /videos (sora). `seconds` is a STRING here (Sora's
+    // enum "4"/"8"/"12") and the size hint is `size` — NOT `aspect_ratio`, which
+    // Sora rejects with "Unknown parameter: 'aspect_ratio'". Reference rides as
+    // input_reference (data URL).
     body = {
       model: wireModel,
       prompt: input.prompt,
       seconds: String(seconds),
     };
-    if (input.aspectRatio) body.aspect_ratio = input.aspectRatio;
-    if (input.size) body.size = input.size;
+    // Snap to a Sora-supported size; an out-of-list size (e.g. 1:1 1024x1024) 400s.
+    const genericSize = snapSizeToSupported(input.size, cap.supportedSizes);
+    if (genericSize) body.size = genericSize;
     if (input.resolution) body.resolution = input.resolution;
     if (hasReference) body.input_reference = input.imageRef!.dataUrl;
     if (typeof input.generateAudio === 'boolean') body.generate_audio = input.generateAudio;
