@@ -58,6 +58,8 @@ import { navigate as navigateRoute, useRoute } from '../router';
 import {
   API_PROTOCOL_LABELS,
   API_PROTOCOL_TABS,
+  isFixedOriginGateway,
+  resolveFixedOriginBaseUrl,
   SUGGESTED_MODELS_BY_PROTOCOL,
 } from '../state/apiProtocols';
 import {
@@ -328,20 +330,9 @@ function hidesAccountModelSourceLabel(protocol: ApiProtocol): boolean {
   return ACCOUNT_MODEL_SOURCE_LABEL_HIDDEN.has(protocol);
 }
 
-// Fixed-origin gateways: a single managed endpoint where the user configures
-// nothing but the API key. Both the "gateway preset" dropdown (only ever one
-// entry + the custom escape hatch) and the editable Base URL field are
-// redundant noise for these, so we hide both — the resolved origin is filled in
-// automatically on protocol switch. Add a protocol here when it's such a
-// gateway. (Other single-provider protocols like azure are NOT listed: they
-// rely on the preset's custom-endpoint path and a user-entered Base URL.)
-const FIXED_ORIGIN_GATEWAYS = new Set<ApiProtocol>([
-  'aihubmix',
-]);
-
-function isFixedOriginGateway(protocol: ApiProtocol): boolean {
-  return FIXED_ORIGIN_GATEWAYS.has(protocol);
-}
+// Fixed-origin gateway helpers (isFixedOriginGateway / resolveFixedOriginBaseUrl)
+// live in ../state/apiProtocols so config loading and the top-bar switcher share
+// the same single source of truth.
 
 type ProviderModelsState =
   | { status: 'idle' }
@@ -746,7 +737,7 @@ function applyApiProtocolConfig(
     ...config,
     apiProtocol: protocol,
     apiKey: apiConfig.apiKey,
-    baseUrl: apiConfig.baseUrl,
+    baseUrl: resolveFixedOriginBaseUrl(protocol, apiConfig.baseUrl),
     model: apiConfig.model,
     apiProviderBaseUrl: apiConfig.apiProviderBaseUrl ?? null,
     apiVersion: protocol === 'azure' ? (apiConfig.apiVersion ?? '') : '',
@@ -988,7 +979,13 @@ export function SettingsDialog({
 }: Props) {
   const { t, locale, setLocale } = useI18n();
   const analytics = useAnalytics();
-  const [cfg, setCfg] = useState<AppConfig>(initial);
+  // Backfill the fixed-origin base URL on mount too, so a config persisted with
+  // an empty baseUrl (e.g. selected AIHubMix before this resolution existed)
+  // isn't stuck blocking the live model fetch until the user re-selects the tab.
+  const [cfg, setCfg] = useState<AppConfig>(() => ({
+    ...initial,
+    baseUrl: resolveFixedOriginBaseUrl(initial.apiProtocol ?? 'anthropic', initial.baseUrl),
+  }));
   const [pendingMediaProviderEditIds, setPendingMediaProviderEditIds] = useState<
     ReadonlySet<string>
   >(() => new Set());

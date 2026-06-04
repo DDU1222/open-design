@@ -9,6 +9,7 @@ import type {
   OrbitConfig,
   PetConfig,
 } from '../types';
+import { resolveFixedOriginBaseUrl } from './apiProtocols';
 import {
   DEFAULT_ACCENT_COLOR,
   normalizeAccentColor,
@@ -441,6 +442,15 @@ export function loadConfig(): AppConfig {
         merged.apiProviderBaseUrl = knownProvider?.baseUrl ?? null;
       }
       merged.configMigrationVersion = CONFIG_MIGRATION_VERSION;
+    }
+
+    // Fixed-origin gateways (e.g. AIHubMix) hide the Base URL field, so a config
+    // persisted before the origin was auto-resolved can carry an empty baseUrl.
+    // Backfill it here so every consumer (Settings form, top-bar switcher, chat)
+    // sees the canonical origin — an empty value otherwise blocks the live
+    // model-list fetch and leaves only the static suggestion list.
+    if (merged.apiProtocol) {
+      merged.baseUrl = resolveFixedOriginBaseUrl(merged.apiProtocol, merged.baseUrl);
     }
 
     return merged;
