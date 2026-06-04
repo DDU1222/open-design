@@ -1151,6 +1151,20 @@
 .agent-card.disabled.agent-card-unavailable {
   opacity: 0.72;
 }
+/* Unavailable cards stack vertically: the logo/name/links live in a single
+   top row, and any diagnostic reason gets its own full-width row underneath
+   instead of being wedged into the middle column. */
+.agent-card.agent-card-unavailable {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 0;
+}
+.agent-card-unavailable-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+}
 .agent-card-actions {
   display: flex;
   flex-wrap: wrap;
@@ -1189,6 +1203,21 @@
 }
 .agent-card-link--muted:hover {
   color: var(--text);
+}
+/* Docs as a compact icon button: same height as the Install ghost button so
+   the inline action row stays aligned, but square and borderless. The accessible
+   name lives in title/aria-label, surfaced as a hover tooltip. */
+.agent-card-link--icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: var(--radius-sm);
+}
+.agent-card-link--icon:hover {
+  background: var(--bg-subtle);
+  text-decoration: none;
 }
 /* Install link: primary affordance for an unavailable card, styled as
    a ghost button (transparent + outlined) so it reads as a real

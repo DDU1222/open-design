@@ -849,6 +849,40 @@ describe('FileWorkspace launcher tab creation', () => {
     });
   });
 
+  it('opens a share request without dropping existing browser tabs', async () => {
+    const onTabsStateChange = vi.fn();
+    const browserTabs = [
+      {
+        id: '__browser__:1',
+        label: 'Browser 1',
+        title: 'Dribbble',
+        url: 'https://dribbble.com/',
+      },
+    ];
+
+    render(
+      <FileWorkspace
+        projectId="project-1"
+        projectKind="prototype"
+        files={[workspaceFile('cover.html'), workspaceFile('landing.html')]}
+        liveArtifacts={[]}
+        onRefreshFiles={vi.fn()}
+        isDeck={false}
+        tabsState={{ tabs: ['cover.html'], active: '__browser__:1', browserTabs }}
+        shareRequest={{ name: 'landing.html', nonce: 1 }}
+        onTabsStateChange={onTabsStateChange}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(onTabsStateChange).toHaveBeenCalledWith({
+        tabs: ['cover.html', 'landing.html'],
+        active: 'landing.html',
+        browserTabs,
+      });
+    });
+  });
+
   it('focuses the design-system workspace tab without adding it to file tabs', async () => {
     const onTabsStateChange = vi.fn();
 

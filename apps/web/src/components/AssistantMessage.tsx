@@ -6,7 +6,6 @@ import {
   type MarkdownLinkClickHandler,
 } from "../runtime/markdown";
 import { asInProjectFilePath } from "../runtime/in-project-link";
-import { copyToClipboard } from "../lib/copy-to-clipboard";
 import { projectFileUrl } from "../providers/registry";
 import { submitChatRunToolResult } from "../providers/daemon";
 import { useAnalytics } from "../analytics/provider";
@@ -34,7 +33,7 @@ import {
   stripTrailingOpenQuestionForm,
   type QuestionForm,
 } from "../artifacts/question-form";
-import { stripArtifact } from "../artifacts/strip";
+import { splitStreamingArtifact, stripArtifact } from "../artifacts/strip";
 import { QuestionFormView, parseSubmittedAnswers } from "./QuestionForm";
 import {
   getPluginFolderCandidates,
@@ -42,6 +41,8 @@ import {
 } from "./design-files/pluginFolders";
 import type { PluginFolderAgentAction } from "./design-files/pluginFolderActions";
 import { Icon } from "./Icon";
+import { NextStepActions } from "./NextStepActions";
+import { copyToClipboard } from "../lib/copy-to-clipboard";
 import { useT } from "../i18n";
 import { deriveFileOps, type FileOpEntry } from "../runtime/file-ops";
 import {
@@ -50,7 +51,8 @@ import {
   type TodoItem,
 } from "../runtime/todos";
 import type { Dict } from "../i18n/types";
-import { agentDisplayName, exactAgentDisplayName } from "../utils/agentLabels";
+import { agentDisplayName, agentIconId, exactAgentDisplayName } from "../utils/agentLabels";
+import { AgentIcon } from "./AgentIcon";
 import {
   exactDateTime,
   messageTime,
@@ -284,6 +286,11 @@ function SkillPluginCandidateCard({
 interface Props {
   message: ChatMessage;
   streaming: boolean;
+  // Live-only streaming tool-input partials keyed by tool-use id (raw,
+  // mid-token JSON accumulated from `input_json_delta`). Used to render an
+  // in-flight Write/Edit's code in real time before the full `tool_use`
+  // arrives. Never persisted.
+  liveToolInput?: Record<string, { name: string; text: string }>;
   projectId: string | null;
   // Analytics context for the assistant_feedback_* events. Defaults
   // applied at the call site keep AssistantMessage usable in tests
@@ -324,11 +331,17 @@ interface Props {
   onFeedback?: (change: ChatMessageFeedbackChange) => void;
   suppressDirectionForms?: boolean;
   hasDesignSystemContext?: boolean;
+  // "Next step" affordance handlers, surfaced under the last assistant message
+  // once it has produced a previewable (HTML) artifact. Omitting them hides
+  // the affordance entirely (e.g. in tests that don't wire chat send).
+  onArtifactShare?: (fileName: string) => void;
+  onArtifactChip?: (fileName: string, prompt: string) => void;
 }
 
 // Props compared by reference to decide whether a memoized AssistantMessage can
-// skip re-rendering. The four interaction callbacks (onSubmitForm,
-// onContinueRemainingTasks, onForkFromMessage, onFeedback) are DELIBERATELY
+// skip re-rendering. The interaction callbacks (onSubmitForm,
+// onContinueRemainingTasks, onForkFromMessage, onFeedback, and next-step
+// actions) are DELIBERATELY
 // excluded: ChatPane re-creates them per render, but routes them through a ref
 // so their behavior is reference-stable — comparing them would defeat the memo
 // on every streamed frame. `isLast` is compared, which captures the only state
@@ -382,6 +395,7 @@ export const AssistantMessage = memo(AssistantMessageImpl, areAssistantMessagePr
 function AssistantMessageImpl({
   message,
   streaming,
+  liveToolInput,
   projectId,
   projectKind = null,
   conversationId = null,
@@ -402,6 +416,8 @@ function AssistantMessageImpl({
   onFeedback,
   suppressDirectionForms = false,
   hasDesignSystemContext = false,
+  onArtifactShare,
+  onArtifactChip,
 }: Props) {
   const t = useT();
   const events = message.events ?? [];
@@ -413,13 +429,33 @@ function AssistantMessageImpl({
   // The chat-pane-level PinnedTodoBar renders the canonical TodoWrite card
   // above the composer, so we strip any TodoWrite tool-groups out of the
   // per-message flow to avoid the same task list rendering twice.
-  const blocks = stripTodoToolGroups(
+  const persistedBlocks = stripTodoToolGroups(
     stripEmptyThinkingBlocks(
       suppressDuplicateQuestionForms(
         suppressAskUserQuestionFallbackText(buildBlocks(events)),
       ),
     ),
   );
+  // Synthesize live code boxes for tool calls whose JSON input is still
+  // streaming (no full `tool_use` event yet). Gated to code-writing tools so
+  // a Bash/Grep/TodoWrite input stream doesn't spawn a code panel. These
+  // append after the persisted blocks since the in-flight tool is the latest
+  // activity. Disappear automatically once the full `tool_use` lands (the id
+  // leaves `liveToolInput`) or the run ends (the map is wiped upstream).
+  const liveBlocks = useMemo<Block[]>(() => {
+    if (!streaming || !liveToolInput) return [];
+    const settledUseIds = new Set(
+      events.filter((e) => e.kind === "tool_use").map((e) => e.id),
+    );
+    const out: Block[] = [];
+    for (const [id, entry] of Object.entries(liveToolInput)) {
+      if (settledUseIds.has(id)) continue;
+      if (!isLiveCodeToolName(entry.name)) continue;
+      out.push({ kind: "live-tool", id, name: entry.name, raw: entry.text });
+    }
+    return out;
+  }, [streaming, liveToolInput, events]);
+  const blocks = liveBlocks.length ? [...persistedBlocks, ...liveBlocks] : persistedBlocks;
   const fileOps = useMemo(() => deriveFileOps(events), [events]);
   const produced = message.producedFiles ?? [];
   const displayedProduced = useMemo(
@@ -434,6 +470,13 @@ function AssistantMessageImpl({
             streaming,
           }),
     [blocks, fileOps, message, produced, projectFiles, streaming],
+  );
+  // The single artifact the "next step" affordance anchors to: prefer the
+  // first HTML produced file (decks/prototypes are HTML and are the ones the
+  // Share/Export menu + visual-polish loop apply to).
+  const nextStepArtifactName = useMemo(
+    () => pickPreviewableArtifact(displayedProduced),
+    [displayedProduced],
   );
   const pluginActionFolders = useMemo(
     () =>
@@ -504,7 +547,8 @@ function AssistantMessageImpl({
   const usage = events.find((e) => e.kind === "usage") as
     | Extract<AgentEvent, { kind: "usage" }>
     | undefined;
-  const roleLabel = assistantRoleLabel(message, t);
+  const roleName = assistantRoleName(message, t);
+  const roleIconId = agentIconId(message.agentId, message.agentName);
   const hasEmptyResponse = events.some(
     (e) => e.kind === "status" && e.label === "empty_response"
   );
@@ -537,6 +581,19 @@ function AssistantMessageImpl({
     hasEmptyResponse ||
     !!copyMarkdown ||
     canFork;
+  // Pre-output vs working: before any real content (text / thinking / tools /
+  // files) the footer shimmers "Preparing…"; the moment content lands it
+  // flips to "Working" and the elapsed clock restarts from that instant.
+  const hasContent = blocks.some((b) => b.kind !== "status") || fileOps.length > 0;
+  const preparing = streaming && !hasContent;
+  const [outputStartedAt, setOutputStartedAt] = useState<number | undefined>(undefined);
+  useEffect(() => {
+    if (streaming && hasContent) {
+      setOutputStartedAt((prev) => prev ?? Date.now());
+    } else if (!streaming) {
+      setOutputStartedAt(undefined);
+    }
+  }, [streaming, hasContent]);
   // Track which forms the user submitted in this session so we lock them
   // immediately on click (without waiting for the parent to re-render).
   const [locallySubmitted, setLocallySubmitted] = useState<Set<string>>(
@@ -562,19 +619,23 @@ function AssistantMessageImpl({
     [isLast, message.runId],
   );
 
+  // Index of the trailing text block — the streaming caret rides the end of
+  // the last prose block so it tracks the final character as tokens arrive.
+  let lastTextBlockIndex = -1;
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    if (blocks[i]?.kind === "text") {
+      lastTextBlockIndex = i;
+      break;
+    }
+  }
+
   return (
     <div className="msg assistant">
       <div className="role">
-        <span>{roleLabel}</span>
-        <MessageTimestamp message={message} t={t} />
+        <AgentIcon id={roleIconId} size={20} className="role-agent-icon" />
+        <span className="role-name">{roleName}</span>
       </div>
       <div className="assistant-flow">
-        {blocks.length === 0 && streaming ? (
-          <WaitingPill
-            startedAt={message.startedAt}
-            latestStatus={latestStatusLabel(events)}
-          />
-        ) : null}
         {fileOps.length > 0 ? (
           <FileOpsSummary
             entries={fileOps}
@@ -591,6 +652,7 @@ function AssistantMessageImpl({
                 text={b.text}
                 isLastAssistant={!!isLast}
                 streaming={streaming}
+                showStreamCursor={streaming && i === lastTextBlockIndex}
                 nextUserContent={nextUserContent}
                 locallySubmitted={locallySubmitted}
                 suppressDirectionForms={suppressDirectionForms}
@@ -607,7 +669,16 @@ function AssistantMessageImpl({
               />
             );
           if (b.kind === "thinking")
-            return <ThinkingBlock key={i} text={b.text} />;
+            // Thinking is only "in progress" while this is the trailing block.
+            // Once any block (prose / tools) lands after it, the model has
+            // moved past thinking, so the block flips to its finished state.
+            return (
+              <ThinkingBlock
+                key={i}
+                text={b.text}
+                streaming={streaming && i === blocks.length - 1}
+              />
+            );
           if (b.kind === "tool-group") {
             return (
               <ToolGroupCard
@@ -622,6 +693,9 @@ function AssistantMessageImpl({
                 onAnswerToolUse={onAnswerToolUse}
               />
             );
+          }
+          if (b.kind === "live-tool") {
+            return <LiveCodeBox key={b.id} name={b.name} raw={b.raw} />;
           }
           if (b.kind === "plugin-candidate") {
             if (dismissedCandidateIds.has(b.candidateId)) return null;
@@ -648,6 +722,9 @@ function AssistantMessageImpl({
             // this no longer the last assistant message — keep their pill so
             // the error detail still survives reload / history review.
             if (b.label === "error" && message.id === errorCardOwnerId) return null;
+            // The pre-output "initializing" status is surfaced by the footer's
+            // shimmering "Preparing…" label instead of its own pill.
+            if (b.label === "initializing") return null;
             return <StatusPill key={i} label={b.label} detail={b.detail} />;
           }
           return null;
@@ -657,6 +734,18 @@ function AssistantMessageImpl({
             files={displayedProduced}
             projectId={projectId}
             onRequestOpenFile={onRequestOpenFile}
+          />
+        ) : null}
+        {!streaming &&
+        isLast &&
+        projectId &&
+        nextStepArtifactName &&
+        onArtifactShare &&
+        onArtifactChip ? (
+          <NextStepActions
+            fileName={nextStepArtifactName}
+            onShare={onArtifactShare}
+            onChip={onArtifactChip}
           />
         ) : null}
         {!streaming && projectId && pluginActionFolders.length > 0 ? (
@@ -721,10 +810,14 @@ function AssistantMessageImpl({
                   usage,
                   hasUnfinishedTodos: unfinishedTodos.length > 0,
                   hasEmptyResponse,
+                  preparing,
+                  outputStartedAt,
                   copyMarkdown,
                   onFork: canFork ? onForkFromMessage : undefined,
                   forking,
                   forceVisible: true,
+                  message,
+                  isLast: !!isLast,
                 }}
               />
             ) : (
@@ -735,9 +828,13 @@ function AssistantMessageImpl({
                 usage={usage}
                 hasUnfinishedTodos={unfinishedTodos.length > 0}
                 hasEmptyResponse={hasEmptyResponse}
+                preparing={preparing}
+                outputStartedAt={outputStartedAt}
                 copyMarkdown={copyMarkdown}
                 onFork={canFork ? onForkFromMessage : undefined}
                 forking={forking}
+                message={message}
+                isLast={!!isLast}
               />
             )}
           </div>
@@ -745,6 +842,17 @@ function AssistantMessageImpl({
       </div>
     </div>
   );
+}
+
+// Return the name of the first previewable HTML artifact among the produced
+// files, or null if this turn produced no shareable/polishable preview. Only
+// HTML files drive the preview workspace's Share/Export menu and the
+// visual-polish loop, so the "next step" affordance keys off them.
+function pickPreviewableArtifact(files: ProjectFile[]): string | null {
+  const html = files.find(
+    (f) => f.kind === "html" || /\.html?$/i.test(f.name),
+  );
+  return html ? html.name : null;
 }
 
 function inferProducedFilesFromTurn({
@@ -813,6 +921,25 @@ function MessageTimestamp({
   );
 }
 
+// The agent name without the trailing model id — the role header shows the
+// brand logo + name only, so the `· model` suffix is dropped there.
+export function assistantRoleName(
+  message: ChatMessage,
+  t: TranslateFn
+): string {
+  const fromName = message.agentName?.trim();
+  if (fromName) {
+    const base = fromName.split(" · ")[0]?.trim() || fromName;
+    return exactAgentDisplayName(base) ?? base;
+  }
+  const fromId = agentDisplayName(message.agentId);
+  if (fromId) return fromId;
+  const starting = message.events?.find(
+    (e) => e.kind === "status" && e.label === "starting" && e.detail
+  ) as Extract<AgentEvent, { kind: "status" }> | undefined;
+  return agentDisplayName(starting?.detail) ?? t("assistant.role");
+}
+
 export function assistantRoleLabel(
   message: ChatMessage,
   t: TranslateFn
@@ -863,11 +990,20 @@ interface AssistantFooterProps {
   usage: Extract<AgentEvent, { kind: "usage" }> | undefined;
   hasUnfinishedTodos: boolean;
   hasEmptyResponse: boolean;
+  // Pre-output phase: streaming but nothing rendered yet. The label shimmers
+  // "Preparing…"; once content lands it flips to "Working" and the elapsed
+  // counter restarts from `outputStartedAt` (the moment content appeared).
+  preparing?: boolean;
+  outputStartedAt?: number | undefined;
   copyMarkdown?: string;
   onFork?: () => void;
   forking?: boolean;
   feedbackControls?: ReactNode;
   forceVisible?: boolean;
+  message?: ChatMessage;
+  // The most recent assistant reply keeps its footer permanently visible
+  // (not hover-gated), matching Lobe Chat's persistent last-message footer.
+  isLast?: boolean;
 }
 
 function AssistantFooter({
@@ -877,14 +1013,23 @@ function AssistantFooter({
   usage,
   hasUnfinishedTodos,
   hasEmptyResponse,
+  preparing = false,
+  outputStartedAt,
   copyMarkdown,
   onFork,
   forking = false,
   feedbackControls,
   forceVisible = false,
+  message,
+  isLast = false,
 }: AssistantFooterProps) {
   const t = useT();
-  const elapsed = useLiveElapsed(streaming, startedAt, endedAt, usage?.durationMs);
+  // While "working" (streaming with content) the timer counts from when
+  // content first appeared, not from the run start, so it reads as a fresh
+  // generation clock. Preparing and the final done state both use startedAt.
+  const elapsedStart =
+    streaming && !preparing ? outputStartedAt ?? startedAt : startedAt;
+  const elapsed = useLiveElapsed(streaming, elapsedStart, endedAt, usage?.durationMs);
   const formattedCost =
     typeof usage?.costUsd === "number" &&
     Number.isFinite(usage.costUsd) &&
@@ -907,11 +1052,15 @@ function AssistantFooter({
     <div
       className="assistant-footer"
       data-unfinished={hasUnfinishedTodos ? "true" : "false"}
+      data-streaming={streaming ? "true" : "false"}
+      data-last={isLast ? "true" : "false"}
     >
       <span className="dot" data-active={streaming ? "true" : "false"} />
-      <span className="assistant-label">
+      <span className={`assistant-label${streaming && preparing ? " shimmer-text shimmer-prepare" : ""}`}>
         {streaming
-          ? t("assistant.workingLabel")
+          ? preparing
+            ? t("assistant.statusPreparing")
+            : t("assistant.workingLabel")
           : hasEmptyResponse
           ? t("assistant.emptyResponseLabel")
           : hasUnfinishedTodos
@@ -937,6 +1086,7 @@ function AssistantFooter({
           {feedbackControls}
         </span>
       ) : null}
+      {!streaming && message ? <MessageTimestamp message={message} t={t} /> : null}
     </div>
   );
 }
@@ -1766,69 +1916,12 @@ function hasPluginFinalActionHint(content: string): boolean {
   );
 }
 
-/**
- * The pre-first-block waiting indicator. Shows "Waiting for first output…"
- * normally, the latest status label (initializing / starting / thinking /
- * streaming) once we have one, plus a soft hint after ~12 seconds telling
- * the user they can stop the run if it really seems stuck.
- */
-function WaitingPill({
-  startedAt,
-  latestStatus,
-}: {
-  startedAt?: number;
-  latestStatus?: { label: string; detail?: string | undefined };
-}) {
-  const t = useT();
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const id = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => window.clearInterval(id);
-  }, []);
-  const elapsedSec = startedAt
-    ? Math.max(0, Math.round((now - startedAt) / 1000))
-    : 0;
-  const slow = elapsedSec >= 12;
-  const label = latestStatus?.label
-    ? humanizeStatus(latestStatus.label, t)
-    : t("assistant.waitingFirstOutput");
-  return (
-    <div className="op-waiting">
-      <span className="op-waiting-dot" aria-hidden />
-      <span className="op-waiting-label">{label}</span>
-      {latestStatus?.detail ? (
-        <code className="op-waiting-detail">{latestStatus.detail}</code>
-      ) : null}
-      {slow ? (
-        <span className="op-waiting-hint">{t("assistant.slowHint")}</span>
-      ) : null}
-    </div>
-  );
-}
-
-function humanizeStatus(label: string, t: (k: keyof Dict) => string): string {
-  if (label === "initializing") return t("assistant.statusBootingAgent");
-  if (label === "starting") return t("assistant.statusStarting");
-  if (label === "requesting") return t("assistant.statusRequesting");
-  if (label === "thinking") return t("assistant.statusThinking");
-  if (label === "streaming") return t("assistant.statusStreaming");
-  return label.charAt(0).toUpperCase() + label.slice(1);
-}
-
-function latestStatusLabel(
-  events: AgentEvent[]
-): { label: string; detail?: string | undefined } | undefined {
-  for (let i = events.length - 1; i >= 0; i--) {
-    const ev = events[i]!;
-    if (ev.kind === "status") return { label: ev.label, detail: ev.detail };
-  }
-  return undefined;
-}
 
 function ProseBlock({
   text,
   isLastAssistant,
   streaming,
+  showStreamCursor,
   nextUserContent,
   locallySubmitted,
   suppressDirectionForms,
@@ -1839,6 +1932,7 @@ function ProseBlock({
   text: string;
   isLastAssistant: boolean;
   streaming: boolean;
+  showStreamCursor?: boolean;
   nextUserContent?: string;
   locallySubmitted: Set<string>;
   suppressDirectionForms: boolean;
@@ -1846,6 +1940,7 @@ function ProseBlock({
   onOpenQuestions?: () => void;
   onRequestOpenFile?: (name: string) => void;
 }) {
+  const t = useT();
   const cleaned = useMemo(() => stripArtifact(text), [text]);
   // While the latest turn is still streaming a not-yet-closed question-form,
   // drop the partial `<question-form>{…` markup from the prose so the chat
@@ -1858,7 +1953,16 @@ function ProseBlock({
         : { text: cleaned, hadOpenForm: false },
     [cleaned, isLastAssistant, streaming],
   );
-  const segments = useMemo(() => splitOnQuestionForms(visibleText), [visibleText]);
+  // While an `<artifact type="text/html">` is still streaming (no closing tag
+  // yet), surface its body in a live code panel instead of leaking the raw
+  // tag + half-written HTML as Markdown text. Once it closes, stripArtifact
+  // removes it and the file/preview panel takes over — so this only fires
+  // mid-stream.
+  const { head, live } = useMemo(
+    () => (streaming ? splitStreamingArtifact(visibleText) : { head: visibleText, live: null }),
+    [visibleText, streaming]
+  );
+  const segments = useMemo(() => splitOnQuestionForms(head), [head]);
   // Route relative file-link clicks (`template.html`, `subdir/hero.html`)
   // through the workspace tab opener. Without this, Electron's window-open
   // handler creates a new app window whose relative href can't resolve, and
@@ -1899,9 +2003,9 @@ function ProseBlock({
       }));
     }
   );
-  if (renderable.length === 0) return null;
+  if (renderable.length === 0 && !live) return null;
   return (
-    <div className="prose-block">
+    <div className="prose-block" data-stream-cursor={showStreamCursor && !live ? "true" : undefined}>
       {renderable.map((seg) => {
         if (seg.kind === "reminder") {
           return <SystemReminderBlock key={seg.key} text={seg.text} />;
@@ -1934,6 +2038,13 @@ function ProseBlock({
           />
         );
       })}
+      {live ? (
+        <StreamingCodeCard
+          titleLabel={t("tool.write")}
+          metaLabel={live.title || live.identifier || undefined}
+          code={live.content}
+        />
+      ) : null}
       {hadOpenForm ? <QuestionsBanner onOpen={onOpenQuestions} /> : null}
     </div>
   );
@@ -2038,26 +2149,51 @@ function SystemReminderBlock({ text }: { text: string }) {
   );
 }
 
-function ThinkingBlock({ text }: { text: string }) {
+function ThinkingBlock({ text, streaming }: { text: string; streaming?: boolean }) {
   const t = useT();
   const [open, setOpen] = useState(false);
-  const preview = text.trim().slice(0, 140);
+  const isThinking = streaming === true;
+  // Thinking events carry no server timestamps, so the "用时 X 秒" duration is
+  // measured client-side: stamp the start when streaming begins and freeze the
+  // elapsed once it ends. Blocks restored from history never stream, so they
+  // fall back to the plain "已深度思考" label with no seconds.
+  const startRef = useRef<number | null>(null);
+  const [elapsedSec, setElapsedSec] = useState<number | null>(null);
+  useEffect(() => {
+    if (isThinking) {
+      if (startRef.current === null) startRef.current = Date.now();
+      setElapsedSec(null);
+    } else if (startRef.current !== null) {
+      setElapsedSec(Math.max(1, Math.round((Date.now() - startRef.current) / 1000)));
+      startRef.current = null;
+    }
+  }, [isThinking]);
+  const label = isThinking
+    ? t("assistant.thinking")
+    : elapsedSec != null
+      ? t("assistant.thoughtFor", { s: elapsedSec })
+      : t("assistant.thought");
   return (
     <div className="thinking-block">
       <button className="thinking-toggle" onClick={() => setOpen((o) => !o)}>
-        <span className="thinking-icon" aria-hidden>
-          <Icon name="sparkles" size={12} />
+        <span className={`thinking-status${isThinking ? ' op-status-running' : open ? ' thinking-status-active' : ''}`} aria-hidden>
+          {isThinking
+            ? <Icon name="spinner" size={14} />
+            : <Icon name="sparkles" size={14} />
+          }
         </span>
-        <span className="thinking-label">{t("assistant.thinking")}</span>
-        <span className="thinking-preview">
-          {open ? "" : preview}
-          {!open && text.length > 140 ? "…" : ""}
+        <span className={`thinking-label${isThinking ? ' shimmer-text' : ''}`}>
+          {label}
         </span>
         <span className="thinking-chev">
           <Icon name={open ? "chevron-down" : "chevron-right"} size={11} />
         </span>
       </button>
-      {open ? <pre className="thinking-body">{text}</pre> : null}
+      <div className={`accordion-collapsible${open ? ' open' : ''}`}>
+        <div className="accordion-collapsible-inner">
+          <div className="thinking-body">{renderMarkdown(text)}</div>
+        </div>
+      </div>
     </div>
   );
 }
@@ -2179,6 +2315,139 @@ function dedupeSnapshotToolRetries(items: ToolItem[]): ToolItem[] {
   return collapsed;
 }
 
+// Tools whose streaming JSON input is worth previewing as live code. Other
+// tools (Bash, Grep, TodoWrite, …) stream JSON too but a code panel for them
+// would be noise.
+const LIVE_CODE_TOOL_NAMES = new Set([
+  "Write",
+  "write",
+  "Edit",
+  "edit",
+  "MultiEdit",
+  "multiedit",
+  "NotebookEdit",
+]);
+
+function isLiveCodeToolName(name: string): boolean {
+  return LIVE_CODE_TOOL_NAMES.has(name);
+}
+
+// Pull the (possibly still-streaming) value of a top-level JSON string field
+// out of a raw, not-yet-closed JSON fragment. Returns the decoded text up to
+// wherever the stream currently ends — an unterminated escape or \u sequence
+// at the tail is dropped rather than throwing. Returns null when the field /
+// its opening quote hasn't arrived yet. Good enough for a live preview; the
+// authoritative value comes from the parsed `tool_use.input` once complete.
+function extractStreamingJsonString(raw: string, field: string): string | null {
+  const marker = `"${field}"`;
+  const mi = raw.indexOf(marker);
+  if (mi === -1) return null;
+  let i = mi + marker.length;
+  // Advance to the value's opening quote, past the `:` and any whitespace.
+  while (i < raw.length && raw[i] !== '"') i++;
+  if (i >= raw.length) return null;
+  i++; // step past the opening quote
+  let out = "";
+  while (i < raw.length) {
+    const ch = raw[i]!;
+    if (ch === "\\") {
+      const next = raw[i + 1];
+      if (next === undefined) break; // incomplete escape at the streaming tail
+      switch (next) {
+        case "n": out += "\n"; break;
+        case "t": out += "\t"; break;
+        case "r": out += "\r"; break;
+        case '"': out += '"'; break;
+        case "\\": out += "\\"; break;
+        case "/": out += "/"; break;
+        case "b": out += "\b"; break;
+        case "f": out += "\f"; break;
+        case "u": {
+          const hex = raw.slice(i + 2, i + 6);
+          if (hex.length < 4) return out; // incomplete \u escape at the tail
+          out += String.fromCharCode(parseInt(hex, 16));
+          i += 6;
+          continue;
+        }
+        default: out += next;
+      }
+      i += 2;
+      continue;
+    }
+    if (ch === '"') break; // closing quote → value complete
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
+// Presentational in-flight code panel: a boxed header (spinner + shimmer
+// title + optional meta) over a monospace body with a typing caret. Plain
+// monospace on purpose — shiki highlighting is async and would thrash on
+// every streamed delta; the finished, highlighted view is taken over by the
+// normal card once the write/artifact completes. Shared by the tool-call
+// path (LiveCodeBox) and the streaming-artifact path (ProseBlock).
+function StreamingCodeCard({
+  titleLabel,
+  metaLabel,
+  code,
+}: {
+  titleLabel: string;
+  metaLabel?: string;
+  code: string;
+}) {
+  const preRef = useRef<HTMLPreElement | null>(null);
+  // Keep the latest streamed line in view as code grows.
+  useEffect(() => {
+    const el = preRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [code]);
+  return (
+    <div className="op-card op-file live-code-box">
+      <div className="op-card-head live-code-head">
+        <span className="action-card-status op-status-running" aria-hidden>
+          <Icon name="spinner" size={14} />
+        </span>
+        <span className="op-title shimmer-text">{titleLabel}</span>
+        {metaLabel ? <span className="op-meta">{metaLabel}</span> : null}
+      </div>
+      {code ? (
+        <pre className="live-code-pre" ref={preRef}>
+          <code>
+            {code}
+            <span className="live-code-caret" aria-hidden />
+          </code>
+        </pre>
+      ) : null}
+    </div>
+  );
+}
+
+// In-flight code panel rendered from a tool call whose JSON input is still
+// streaming. The finished view is taken over by the normal tool card once
+// `tool_use` lands.
+function LiveCodeBox({ name, raw }: { name: string; raw: string }) {
+  const t = useT();
+  const file =
+    extractStreamingJsonString(raw, "file_path") ??
+    extractStreamingJsonString(raw, "filePath") ??
+    extractStreamingJsonString(raw, "path") ??
+    "";
+  const baseName = file ? file.split("/").pop() ?? file : "";
+  const code =
+    extractStreamingJsonString(raw, "content") ??
+    extractStreamingJsonString(raw, "new_string") ??
+    "";
+  const isEdit = /edit/i.test(name);
+  return (
+    <StreamingCodeCard
+      titleLabel={isEdit ? t("tool.edit") : t("tool.write")}
+      metaLabel={baseName || undefined}
+      code={code}
+    />
+  );
+}
+
 function ToolGroupCard({
   items,
   runStreaming,
@@ -2230,6 +2499,7 @@ function ToolGroupCard({
 
   const summary = summarizeGroup(items, t, runStreaming, runSucceeded);
   const running = runStreaming && items.some((it) => !it.result);
+  const hasError = items.some((it) => it.result?.isError);
   return (
     <div className="action-card">
       <button
@@ -2238,11 +2508,16 @@ function ToolGroupCard({
         onClick={() => setOpen((o) => !o)}
         aria-expanded={open}
       >
-        <span className="ico" aria-hidden>
-          {summary.icon}
+        <span className={`action-card-status ${running ? 'op-status-running' : hasError ? 'op-status-error' : 'op-status-ok'}`} aria-hidden>
+          {running
+            ? <Icon name="spinner" size={14} />
+            : hasError
+            ? <Icon name="close" size={14} />
+            : <Icon name="check" size={14} />
+          }
         </span>
-        <span className="summary">
-          <strong>{summary.label}</strong>
+        <span className={`summary${running ? ' shimmer-text' : ''}`}>
+          {summary.label}
         </span>
         <span className="chev" aria-hidden>
           <Icon name={open ? "chevron-down" : "chevron-right"} size={11} />
@@ -2366,6 +2641,7 @@ type Block =
   | { kind: "text"; text: string }
   | { kind: "thinking"; text: string }
   | { kind: "tool-group"; items: ToolItem[] }
+  | { kind: "live-tool"; id: string; name: string; raw: string }
   | {
       kind: "plugin-candidate";
       candidateId: string;
@@ -2505,6 +2781,7 @@ function buildBlocks(events: AgentEvent[]): Block[] {
       if (
         ev.label === "streaming" ||
         ev.label === "starting" ||
+        ev.label === "running" ||
         ev.label === "requesting" ||
         ev.label === "thinking" ||
         ev.label === "empty_response"

@@ -464,8 +464,9 @@ export function MemoryModelInline({
         aria-labelledby={labelId}
         className="inline-switcher__select settings-model-select settings-model-select--byok"
         searchPlaceholder={t('designs.searchPlaceholder')}
+        searchInputTestId="memory-model-inline-search"
+        popoverTestId="memory-model-inline-popover"
         popoverClassName="settings-byok-select-popover"
-        minSearchableOptions={Number.POSITIVE_INFINITY}
         models={selectOptions}
         value={selectValue}
         disabled={busy}

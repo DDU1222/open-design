@@ -1,5 +1,7 @@
 import type {
   AgentInfo,
+  AgentDiagnostic,
+  AgentFixIntent,
   AgentCliEnvPrefs,
   AgentModelPrefs,
   AgentTestRequest,
@@ -528,6 +530,8 @@ export interface PromptTemplateDetail extends PromptTemplateSummary {
 
 export type {
   AgentInfo,
+  AgentDiagnostic,
+  AgentFixIntent,
   AgentTestRequest,
   AppVersionInfo,
   AppVersionResponse,

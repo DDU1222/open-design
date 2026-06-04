@@ -45,6 +45,7 @@
     "posthog-js": "1.374.2",
     "react": "18.3.1",
     "react-dom": "18.3.1",
+    "shiki": "4.1.0",
     "lexical": "0.36.2",
     "@lexical/react": "0.36.2",
     "@lexical/utils": "0.36.2"

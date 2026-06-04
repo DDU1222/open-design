@@ -161,6 +161,7 @@ import { ProjectDesignSystemPicker } from './ProjectDesignSystemPicker';
 import { PluginDetailsModal } from './PluginDetailsModal';
 import { DesignSystemPreviewModal } from './DesignSystemPreviewModal';
 import { ChatPane } from './ChatPane';
+import { WorkingDirPill } from './WorkingDirPill';
 import type { ChatSendMeta } from './ChatComposer';
 import {
   CritiqueTheaterMount,
@@ -798,6 +799,12 @@ export function ProjectView({
   const [activePluginActionPaths, setActivePluginActionPaths] = useState<Set<string>>(() => new Set());
   const [hiddenAssistantPluginActionPaths, setHiddenAssistantPluginActionPaths] = useState<Set<string>>(() => new Set());
   const [forceStreamingPluginMessageIds, setForceStreamingPluginMessageIds] = useState<Set<string>>(() => new Set());
+  // Ephemeral, live-only accumulation of a tool call's streaming JSON input,
+  // keyed by tool-use id (globally unique per run). Fed by `onToolInputDelta`
+  // while the model is still emitting `input_json_delta`; dropped per-id once
+  // the full `tool_use` lands and wiped when the run ends. Never persisted —
+  // see daemon `daemonAgentPayloadToPersistedAgentEvent` (returns null).
+  const [liveToolInput, setLiveToolInput] = useState<Record<string, { name: string; text: string }>>({});
   // True once the initial DB read for the active conversation has settled.
   // Auto-send gates on this so it can't fire before listMessages resolves and
   // race-clobber the freshly-pushed user + assistant placeholder. Without
@@ -810,10 +817,19 @@ export function ProjectView({
   const [attachedComments, setAttachedComments] = useState<PreviewComment[]>([]);
   const [streaming, setStreaming] = useState(false);
   const [streamingConversationId, setStreamingConversationId] = useState<string | null>(null);
+  // Safety net: drop any live tool-input partials whose tool never produced a
+  // full `tool_use` (run errored/canceled mid-call) once streaming settles.
+  useEffect(() => {
+    if (!streaming) setLiveToolInput((prev) => (Object.keys(prev).length ? {} : prev));
+  }, [streaming]);
   const [error, setError] = useState<string | null>(null);
   const [audioVoiceOptionsError, setAudioVoiceOptionsError] = useState<string | null>(null);
   const [artifact, setArtifact] = useState<Artifact | null>(null);
   const [filesRefresh, setFilesRefresh] = useState(0);
+  // True while a working-dir replace is reindexing the new folder. Surfaced
+  // to the Design Files panel so the file list shows a loading state instead
+  // of silently sitting on the old tree for the few seconds the scan takes.
+  const [workingDirReplacing, setWorkingDirReplacing] = useState(false);
   const [projectFiles, setProjectFiles] = useState<ProjectFile[]>([]);
   const projectFilesRef = useRef<ProjectFile[]>([]);
   const [liveArtifacts, setLiveArtifacts] = useState<LiveArtifactSummary[]>([]);
@@ -941,6 +957,10 @@ export function ProjectView({
   // include a nonce so re-clicking the same name after the user closed the
   // tab still focuses it.
   const [openRequest, setOpenRequest] = useState<{ name: string; nonce: number } | null>(null);
+  // Like `openRequest`, but additionally asks the preview workspace to open the
+  // file's Share/Export menu. Drives the "Share" next-step action: it reuses the
+  // existing export/deploy surface rather than introducing a new share backend.
+  const [shareRequest, setShareRequest] = useState<{ name: string; nonce: number } | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const cancelRef = useRef<AbortController | null>(null);
   const streamingConversationIdRef = useRef<string | null>(null);
@@ -3018,6 +3038,17 @@ export function ProjectView({
         // file the moment the agent finishes writing it. The file-creating
         // tools we care about: Write (new file), Edit (existing file —
         // surfacing the freshly-modified file is also useful).
+        if (ev.kind === 'tool_use') {
+          // The authoritative input has landed; drop the live partial so the
+          // card renders from the parsed `tool_use.input` instead of the
+          // mid-token JSON fragment.
+          setLiveToolInput((prev) => {
+            if (!(ev.id in prev)) return prev;
+            const next = { ...prev };
+            delete next[ev.id];
+            return next;
+          });
+        }
         if (ev.kind === 'tool_use' && ((ev.name === 'Write' || ev.name === 'write') || ev.name === 'Edit')) {
           const input = ev.input as { file_path?: unknown; filePath?: unknown } | null;
           const filePath = input?.file_path ?? input?.filePath;
@@ -3121,6 +3152,12 @@ export function ProjectView({
         onAgentEvent: (ev: AgentEvent) => {
           if (ev.kind === 'text') textBuffer.appendTextEvent(ev.text);
           else pushEvent(ev);
+        },
+        onToolInputDelta: (id: string, name: string, delta: string) => {
+          setLiveToolInput((prev) => ({
+            ...prev,
+            [id]: { name, text: (prev[id]?.text ?? '') + delta },
+          }));
         },
         onDone: (fullText = '') => {
           textBuffer.flush();
@@ -4560,6 +4597,24 @@ export function ProjectView({
     }
   }, [githubConnected, onOpenSettings, designSystemProject, projectFiles]);
 
+  // "Next step" affordance handlers (shown under the last assistant message
+  // once it produced a previewable HTML artifact). Recommended-direction chips
+  // prefill the composer (not auto-send) so the user reviews before sending;
+  // Share reuses the preview workspace's existing Share/Export menu. There is
+  // deliberately no generic "continue editing" / "optimize visuals" action —
+  // free-form follow-ups belong in the composer and the visual directions are
+  // already covered by the concrete chips, so vague catch-alls only added noise.
+  const handleArtifactChip = useCallback((_fileName: string, prompt: string) => {
+    setComposerDraftSignal({ text: prompt, nonce: Date.now() });
+  }, []);
+  const handleArtifactShare = useCallback(
+    (fileName: string) => {
+      requestOpenFile(fileName);
+      setShareRequest({ name: fileName, nonce: Date.now() });
+    },
+    [requestOpenFile],
+  );
+
   const handleBrowserUsePrompt = useCallback((text: string) => {
     setWorkspaceFocused(false);
     setComposerDraftSignal({
@@ -5078,6 +5133,7 @@ export function ProjectView({
               key={`${project.id}:${activeConversationId ?? 'conversation-unavailable'}:${chatSeed?.id ?? 'ready'}`}
               messages={messages}
               streaming={currentConversationStreaming}
+              liveToolInput={liveToolInput}
               loading={currentConversationLoading}
               sendDisabled={currentConversationSendDisabled}
               queuedItems={currentConversationQueuedItems}
@@ -5119,6 +5175,8 @@ export function ProjectView({
               onOpenQuestions={openQuestionsTab}
               onContinueRemainingTasks={handleContinueRemainingTasks}
               onAssistantFeedback={handleAssistantFeedback}
+              onArtifactShare={handleArtifactShare}
+              onArtifactChip={handleArtifactChip}
               onForkFromMessage={handleForkFromMessage}
               forkingMessageId={forkingMessageId}
               onNewConversation={handleNewConversation}
@@ -5128,6 +5186,19 @@ export function ProjectView({
               onSelectConversation={handleSelectConversation}
               onDeleteConversation={handleDeleteConversation}
               onOpenSettings={onOpenSettings}
+              showByokRecoveryAction={
+                config.mode === 'api' &&
+                daemonLive &&
+                (
+                  !config.apiKey.trim() ||
+                  !config.baseUrl.trim() ||
+                  !config.model.trim()
+                )
+              }
+              onSwitchToLocalCli={() => {
+                setError(null);
+                onModeChange('daemon');
+              }}
               onOpenAmrSettings={onOpenAmrSettings}
               onSwitchToAmrAndRetry={handleSwitchToAmrAndRetry}
               onLaunchAntigravityOauth={handleLaunchAntigravityOauth}
@@ -5233,6 +5304,14 @@ export function ProjectView({
         <FileWorkspace
           projectId={project.id}
           projectKind={projectKindToTracking(project.metadata?.kind) ?? 'prototype'}
+          rootDirName={(() => {
+            const baseDir =
+              projectDetail.project?.metadata?.baseDir ?? project.metadata?.baseDir;
+            return typeof baseDir === 'string'
+              ? baseDir.split(/[/\\]/).filter(Boolean).pop()
+              : undefined;
+          })()}
+          reloading={workingDirReplacing}
           resolvedDir={projectDetail.resolvedDir}
           files={projectFiles}
           liveArtifacts={liveArtifacts}
@@ -5246,6 +5325,7 @@ export function ProjectView({
           commentQueueOnSend={commentQueueOnSend}
           commentSendDisabled={currentConversationQueueDisabled}
           openRequest={openRequest}
+          shareRequest={shareRequest}
           liveArtifactEvents={liveArtifactEvents}
           designSystemActivityEvents={designSystemActivityEvents}
           tabsState={openTabsState}
@@ -5293,6 +5373,26 @@ export function ProjectView({
           conversationId={activeConversationId}
           headerActions={(
             <>
+              <WorkingDirPill
+                projectId={project.id}
+                resolvedDir={projectDetail.resolvedDir}
+                onReplaced={({ project: updated }) => {
+                  if (updated) onProjectChange(updated);
+                  // The new working dir has a different file tree, so the
+                  // current listing, breadcrumb nav, and open tabs are all
+                  // stale. Refetch files; DesignFilesPanel's self-heal then
+                  // drops the now-unmatched currentDir back to root.
+                  // projectDetail.refresh() repulls resolvedDir so the
+                  // breadcrumb root + pill show the new folder name even on
+                  // the Electron path, which reports no updated project.
+                  setWorkingDirReplacing(true);
+                  refreshFilesAndDesignMd();
+                  void Promise.all([
+                    refreshWorkspaceItems(),
+                    projectDetail.refresh(),
+                  ]).finally(() => setWorkingDirReplacing(false));
+                }}
+              />
               <EntrySettingsMenu
                 config={config}
                 onThemeChange={handleThemeChange}
