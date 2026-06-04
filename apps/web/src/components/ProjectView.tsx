@@ -187,6 +187,7 @@ import { copyToClipboard } from '../lib/copy-to-clipboard';
 import { effectiveMaxTokens } from '../state/maxTokens';
 import { effectiveAgentModelChoice } from './agentModelSelection';
 import { mediaExecutionPolicyForProjectMetadata } from '../media/execution-policy';
+import { mediaModelProviderId } from '../media/models';
 import {
   useByokImageModelOptions,
   useByokVideoModelOptions,
@@ -636,6 +637,57 @@ function shouldFetchElevenLabsVoiceOptions(project: Project): boolean {
     && !metadata.voice;
 }
 
+// The media model the user picked in the New Project → Media dialog, keyed by
+// surface. For BYOK providers (AIHubMix) media is produced by the generate_*
+// chat tools whose default model comes from the per-request byok*Model field —
+// NOT the `od media generate` dispatcher — so without this seed the dialog pick
+// is dropped and the conversation falls back to the Settings default. Returns
+// undefined for non-media projects (and when the field is empty) so callers fall
+// back to the Settings default exactly as before. The daemon re-validates the id
+// against the active provider's registry, so a mismatched pick is safely ignored.
+function projectMediaModelSeed(
+  metadata: ProjectMetadata | null | undefined,
+  surface: 'image' | 'video' | 'speech',
+): string | undefined {
+  if (!metadata) return undefined;
+  if (surface === 'image' && metadata.kind === 'image') {
+    return metadata.imageModel?.trim() || undefined;
+  }
+  if (surface === 'video' && metadata.kind === 'video') {
+    return metadata.videoModel?.trim() || undefined;
+  }
+  if (surface === 'speech' && metadata.kind === 'audio' && metadata.audioKind === 'speech') {
+    return metadata.audioModel?.trim() || undefined;
+  }
+  return undefined;
+}
+
+function projectMediaVoiceSeed(
+  metadata: ProjectMetadata | null | undefined,
+): string | undefined {
+  if (metadata?.kind === 'audio' && metadata.audioKind === 'speech') {
+    return metadata.voice?.trim() || undefined;
+  }
+  return undefined;
+}
+
+// Carry the creation-time model pick into the conversation ONLY when it belongs
+// to the active BYOK provider. Guards against clobbering a user's Settings
+// default with a model from a different provider — e.g. a SenseAudio user whose
+// image project was created with the dialog's default `gpt-image-2` keeps their
+// configured SenseAudio model instead of being forced to the registry default.
+// AIHubMix's live (`aihubmix-` prefixed) ids resolve via mediaModelProviderId
+// without waiting on the async catalogue, so the AIHubMix path still seeds.
+function byokModelSeedForProtocol(
+  metadata: ProjectMetadata | null | undefined,
+  surface: 'image' | 'video' | 'speech',
+  protocol: string | undefined,
+): string | undefined {
+  const picked = projectMediaModelSeed(metadata, surface);
+  if (!picked) return undefined;
+  return mediaModelProviderId(picked) === protocol ? picked : undefined;
+}
+
 function projectEventToAgentEvent(evt: ProjectEvent): LiveArtifactEventItem['event'] | null {
   if (evt.type === 'file-changed') return null;
   if (evt.type === 'conversation-created') return null;
@@ -770,28 +822,32 @@ export function ProjectView({
   const [commentInspectorActive, setCommentInspectorActive] = useState(false);
   const commentInspectorPortalId = useId();
   const leftInspectorActive = commentInspectorActive;
-  // Per-session override for the BYOK SenseAudio chat's generate_image
-  // tool. Seeded once from Settings (config.byokImageModel) so the
-  // composer dropdown opens on the user's chosen default; subsequent
-  // selections live only in this component's state — page refresh /
-  // project switch resets to the Settings default. Persistent defaults
-  // live in Settings → BYOK → SenseAudio → Image generation model.
+  // Per-session override for the BYOK chat's generate_image tool. Seeded once
+  // from the New Project → Media model pick (project.metadata.imageModel) — but
+  // only when that pick belongs to the active BYOK provider (see
+  // byokModelSeedForProtocol) — falling back to the Settings default
+  // (config.byokImageModel) otherwise. Subsequent selections live only in this
+  // component's state — page refresh / project switch resets to this seed.
+  // Persistent defaults live in Settings → BYOK → Image generation model.
   const [byokImageModelOverride, setByokImageModelOverride] = useState<string>(
-    config.byokImageModel ?? '',
+    () => byokModelSeedForProtocol(project.metadata, 'image', config.apiProtocol) ?? config.byokImageModel ?? '',
   );
   // Same per-session override for the BYOK chat's generate_video tool, seeded
-  // from Settings (config.byokVideoModel). Persistent default lives in
-  // Settings → BYOK → AIHubMix → Video generation model.
+  // from the project's videoModel pick (provider-gated), then Settings.
   const [byokVideoModelOverride, setByokVideoModelOverride] = useState<string>(
-    config.byokVideoModel ?? '',
+    () => byokModelSeedForProtocol(project.metadata, 'video', config.apiProtocol) ?? config.byokVideoModel ?? '',
   );
   // Same per-session overrides for the BYOK chat's generate_speech tool (model +
-  // voice), seeded from Settings.
+  // voice), seeded from the project's speech pick (provider-gated), then Settings.
   const [byokSpeechModelOverride, setByokSpeechModelOverride] = useState<string>(
-    config.byokSpeechModel ?? '',
+    () => byokModelSeedForProtocol(project.metadata, 'speech', config.apiProtocol) ?? config.byokSpeechModel ?? '',
   );
+  // Voice only carries when the speech model itself is carried (same provider),
+  // so a cross-provider voice id never leaks into the request.
   const [byokSpeechVoiceOverride, setByokSpeechVoiceOverride] = useState<string>(
-    config.byokSpeechVoice ?? '',
+    () => (byokModelSeedForProtocol(project.metadata, 'speech', config.apiProtocol)
+      ? projectMediaVoiceSeed(project.metadata)
+      : undefined) ?? config.byokSpeechVoice ?? '',
   );
   // Live model option lists (same hooks the composer/Settings pickers use) so
   // the chat "default" (no explicit pick) resolves to the FIRST catalogue model

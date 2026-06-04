@@ -679,6 +679,17 @@ export function findProvider(id: MediaProviderId): MediaProvider | null {
   return MEDIA_PROVIDERS.find((p) => p.id === id) ?? null;
 }
 
+/**
+ * Resolve the provider that owns a model id. Live AIHubMix catalogue ids are
+ * `aihubmix-` prefixed and absent from the static registry, so match that
+ * namespace first; every other id resolves through {@link findMediaModel}.
+ * Returns undefined for unknown ids.
+ */
+export function mediaModelProviderId(id: string): MediaProviderId | undefined {
+  if (id.startsWith('aihubmix-')) return 'aihubmix';
+  return findMediaModel(id)?.provider;
+}
+
 /** All model IDs grouped by surface, used for prompt-side disclosure. */
 export function modelIdsBySurface(): {
   image: string[];
