@@ -23,11 +23,6 @@ import {
   trackFileUploadResult,
 } from '../analytics/events';
 import { deriveUploadCohort } from '../analytics/upload-tracking';
-import { useByokImageModelOptions, useByokVideoModelOptions, useByokSpeechModelOptions } from "../media/aihubmix-image-models";
-
-// OpenAI-style voices AIHubMix TTS accepts; the picker default ("") falls back
-// to the daemon default (alloy) and lets the LLM still override per-utterance.
-const BYOK_AIHUBMIX_VOICES = ['alloy', 'echo', 'fable', 'onyx', 'nova', 'shimmer'] as const;
 import { projectRawUrl, uploadProjectFiles, openFolderDialog, fetchConnectors } from "../providers/registry";
 import { patchProject } from "../state/projects";
 import { fetchMcpServers } from "../state/mcp";
@@ -62,7 +57,6 @@ import {
 } from './composer/LexicalComposerInput';
 import { CaretFloatingLayer } from './composer/CaretFloatingLayer';
 import { ANNOTATION_EVENT, type AnnotationEventDetail } from "./PreviewDrawOverlay";
-import { SearchableModelSelect } from './modelOptions';
 import { DesignSystemSwitchPicker } from "./DesignSystemSwitchPicker";
 
 type TranslateFn = (key: keyof Dict, vars?: Record<string, string | number>) => string;
@@ -384,11 +378,6 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
   ) {
     const t = useT();
     const analytics = useAnalytics();
-    // Shared hook: live AIHubMix catalogue for aihubmix, static registry for
-    // other providers. Same list the Settings image picker uses.
-    const byokImageModelOptions = useByokImageModelOptions(byokApiProtocol);
-    const byokVideoModelOptions = useByokVideoModelOptions(byokApiProtocol);
-    const byokSpeechModelOptions = useByokSpeechModelOptions(byokApiProtocol);
     const [draft, setDraft] = useState(() => initialDraft ?? loadComposerDraft(draftStorageKey) ?? "");
     // Synchronous mirror of `draft`. Event handlers that mutate the draft off
     // a captured render closure (notably the annotation listener, where two
@@ -2004,191 +1993,13 @@ export const ChatComposer = forwardRef<ChatComposerHandle, Props>(
               t={t}
             />
           ) : null}
-          {(byokApiProtocol === 'senseaudio' || byokApiProtocol === 'aihubmix') && onChangeByokImageModel ? (
-            <div
-              className="composer-byok-image-model"
-              data-testid="composer-byok-image-model"
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 8,
-                padding: '4px 8px',
-                fontSize: 12,
-                color: 'var(--text-muted, #888)',
-              }}
-            >
-              <Icon name="image" size={13} style={{ flexShrink: 0 }} />
-              <label
-                htmlFor="composer-byok-image-model-select"
-                style={{ flexShrink: 0 }}
-              >
-                {t('settings.byokImageModel')}
-              </label>
-              <SearchableModelSelect
-                id="composer-byok-image-model-select"
-                className="inline-switcher__select composer-byok-image-model__select"
-                value={byokImageModel ?? ''}
-                onChange={(value) => onChangeByokImageModel(value)}
-                // Live catalogue from the shared hook: AIHubMix's image models
-                // for aihubmix, the static SenseAudio registry otherwise. Keeps
-                // the picker in sync with Settings / the daemon default.
-                models={byokImageModelOptions.map((m) => ({ id: m.id, label: m.label }))}
-                additionalOptions={[
-                  {
-                    value: '',
-                    label: byokImageModelOptions[0]?.label
-                      ? `${byokImageModelOptions[0].label} (${t('settings.byokModelDefaultOption')})`
-                      : t('settings.byokModelDefaultOption'),
-                  },
-                ]}
-                searchPlaceholder={t('newproj.modelSearch')}
-                searchInputTestId="composer-byok-image-model-search"
-                popoverTestId="composer-byok-image-model-popover"
-                style={{ fontSize: 12 }}
-              />
-            </div>
-          ) : null}
-          {byokApiProtocol === 'aihubmix' && onChangeByokVideoModel ? (
-            <div
-              className="composer-byok-video-model"
-              data-testid="composer-byok-video-model"
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 8,
-                padding: '4px 8px',
-                fontSize: 12,
-                color: 'var(--text-muted, #888)',
-              }}
-            >
-              <Icon name="play" size={13} style={{ flexShrink: 0 }} />
-              <label
-                htmlFor="composer-byok-video-model-select"
-                style={{ flexShrink: 0 }}
-              >
-                {t('settings.byokVideoModel')}
-              </label>
-              <select
-                id="composer-byok-video-model-select"
-                value={byokVideoModel ?? ''}
-                onChange={(e) => onChangeByokVideoModel(e.target.value)}
-                style={{
-                  background: 'transparent',
-                  border: '1px solid var(--border, #444)',
-                  borderRadius: 4,
-                  padding: '2px 6px',
-                  color: 'inherit',
-                  fontSize: 12,
-                }}
-              >
-                <option value="">
-                  {byokVideoModelOptions[0]?.label
-                    ? `${byokVideoModelOptions[0].label} (${t('settings.byokModelDefaultOption')})`
-                    : t('settings.byokModelDefaultOption')}
-                </option>
-                {byokVideoModelOptions.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.label}
-                  </option>
-                ))}
-              </select>
-            </div>
-          ) : null}
-          {/* Image-to-video models (id contains "i2v") require a reference
-              image. Surface a soft hint the moment one is selected so the user
-              knows to upload/generate an image; the daemon still falls back to
-              the newest project image and errors clearly if none exists. */}
-          {byokApiProtocol === 'aihubmix'
-          && onChangeByokVideoModel
-          && (byokVideoModel ?? '').toLowerCase().includes('i2v') ? (
-            <div
-              className="composer-byok-video-i2v-hint"
-              data-testid="composer-byok-video-i2v-hint"
-              style={{
-                display: 'flex',
-                alignItems: 'flex-start',
-                gap: 6,
-                padding: '2px 8px 4px',
-                fontSize: 11,
-                lineHeight: 1.4,
-                color: 'var(--text-muted, #888)',
-              }}
-            >
-              <Icon name="info" size={12} style={{ flexShrink: 0, marginTop: 1 }} />
-              <span>{t('settings.byokVideoI2vHint')}</span>
-            </div>
-          ) : null}
-          {byokApiProtocol === 'aihubmix' && onChangeByokSpeechModel ? (
-            <div
-              className="composer-byok-speech-model"
-              data-testid="composer-byok-speech-model"
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 8,
-                padding: '4px 8px',
-                fontSize: 12,
-                color: 'var(--text-muted, #888)',
-              }}
-            >
-              <Icon name="volume" size={13} style={{ flexShrink: 0 }} />
-              <label htmlFor="composer-byok-speech-model-select" style={{ flexShrink: 0 }}>
-                {t('settings.byokSpeechModel')}
-              </label>
-              <select
-                id="composer-byok-speech-model-select"
-                value={byokSpeechModel ?? ''}
-                onChange={(e) => onChangeByokSpeechModel(e.target.value)}
-                style={{
-                  background: 'transparent',
-                  border: '1px solid var(--border, #444)',
-                  borderRadius: 4,
-                  padding: '2px 6px',
-                  color: 'inherit',
-                  fontSize: 12,
-                }}
-              >
-                <option value="">
-                  {byokSpeechModelOptions[0]?.label
-                    ? `${byokSpeechModelOptions[0].label} (${t('settings.byokModelDefaultOption')})`
-                    : t('settings.byokModelDefaultOption')}
-                </option>
-                {byokSpeechModelOptions.map((m) => (
-                  <option key={m.id} value={m.id}>
-                    {m.label}
-                  </option>
-                ))}
-              </select>
-              {onChangeByokSpeechVoice ? (
-                <>
-                  <label htmlFor="composer-byok-speech-voice-select" style={{ flexShrink: 0, marginLeft: 4 }}>
-                    {t('settings.byokSpeechVoice')}
-                  </label>
-                  <select
-                    id="composer-byok-speech-voice-select"
-                    data-testid="composer-byok-speech-voice"
-                    value={byokSpeechVoice ?? ''}
-                    onChange={(e) => onChangeByokSpeechVoice(e.target.value)}
-                    style={{
-                      background: 'transparent',
-                      border: '1px solid var(--border, #444)',
-                      borderRadius: 4,
-                      padding: '2px 6px',
-                      color: 'inherit',
-                      fontSize: 12,
-                    }}
-                  >
-                    <option value="">alloy (default)</option>
-                    {BYOK_AIHUBMIX_VOICES.map((v) => (
-                      <option key={v} value={v}>
-                        {v}
-                      </option>
-                    ))}
-                  </select>
-                </>
-              ) : null}
-            </div>
-          ) : null}
+          {/* The inline BYOK media-model pickers (image / video / speech +
+              voice) were removed pending a unified model-selection surface.
+              The selected models still flow into the run from the project's
+              creation-time pick (see ProjectView byok*ModelOverride → submit);
+              this only drops the per-composer override UI. The byok* props and
+              handlers are intentionally retained as the plumbing the unified
+              picker will reuse. */}
           <div
             className="composer-input-wrap"
             onFocus={() => setComposerEngaged(true)}
